@@ -1,539 +1,509 @@
--- Admin/RBAC: CREATE the five missing procedures only.
--- Prepared 2 November 2026 IST from current local reference definitions.
--- Select the intended UAT database before running; this file does not switch databases.
--- Requires compatible Access schema, existing business catalogue tables (including
--- di_sourceSetupRequest), and the existing access_api_executor role.
--- CREATE fails if a procedure already exists. No replacements or DROP statements.
--- Original module ANSI/quoted-identifier settings and EXECUTE grants are preserved.
-
+-- RUN SECOND in the SAME intended UAT database after 01_Backup_Four_Procedures.sql.
+-- Covers the four outstanding API signatures, the missing source-request table,
+-- and the permission catalogue Description dependency if it is absent.
+-- No USE statement, application data changes, role grants or feature activation.
+-- Table must be absent, as reported by UAT. Existing objects are not replaced blindly.
+-- All schema and procedure updates below commit together or roll back together.
+SET NOCOUNT ON;
+SET XACT_ABORT ON;
 SET ANSI_NULLS ON;
-SET QUOTED_IDENTIFIER OFF;
-GO
+SET QUOTED_IDENTIFIER ON;
+SET ANSI_PADDING ON;
+SET ANSI_WARNINGS ON;
+SET ARITHABORT ON;
+SET CONCAT_NULL_YIELDS_NULL ON;
+SET NUMERIC_ROUNDABORT OFF;
+IF @@TRANCOUNT<>0 THROW 51090,'Run outside an existing transaction.',1;
+DECLARE @Expected TABLE(OriginalName sysname,BackupName sysname);
 
-CREATE PROCEDURE dbo.sel_accessApplicationView
- @ActorUserId uniqueidentifier, @ActorSessionId uniqueidentifier, @SessionHash binary(32),
- @View varchar(30), @ViewMode char(1)='G', @GroupId uniqueidentifier=NULL,
- @Page int=1, @Take int=20, @Search nvarchar(100)=NULL, @SearchFields varchar(300)=NULL, @Active bit=1,
- @From datetime2(3)=NULL, @To datetime2(3)=NULL,
- @ConfigurationId varchar(200)=NULL, @UploadId varchar(200)=NULL
+INSERT @Expected VALUES
+ (N'commit_accessIdentity',N'commit_accessIdentity2nov2026backup'),
+ (N'commit_accessPermissionCatalog',N'commit_accessPermissionCatalog2nov2026backup'),
+ (N'sel_accessGroupMappings',N'sel_accessGroupMappings2nov2026backup'),
+ (N'sel_accessProcessList',N'sel_accessProcessList2nov2026backup');
+
+BEGIN TRY
+ BEGIN TRANSACTION;
+ IF EXISTS (
+  SELECT 1 FROM @Expected e
+  LEFT JOIN sys.sql_modules m ON m.object_id=OBJECT_ID(N'dbo.'+e.OriginalName,N'P')
+  LEFT JOIN sys.extended_properties ep ON ep.class=1 AND ep.minor_id=0
+   AND ep.major_id=OBJECT_ID(N'dbo.'+e.BackupName,N'P') AND ep.name=N'DI_BackupOriginalSHA256'
+  WHERE m.definition IS NULL OR ep.value IS NULL
+   OR CONVERT(varchar(64),ep.value)<>CONVERT(varchar(64),HASHBYTES('SHA2_256',CONVERT(varbinary(max),m.definition)),2)
+ ) THROW 51090,'Missing backup or original changed since backup. No updates applied.',1;
+ IF OBJECT_ID(N'dbo.di_sourceSetupRequest') IS NOT NULL
+  THROW 51090,'di_sourceSetupRequest already exists. Review its schema before using this missing-table package.',1;
+
+ IF EXISTS (SELECT 1 FROM (VALUES
+ (N'dbo.di_accessAudit'),
+ (N'dbo.di_application'),
+ (N'dbo.di_AppUsers'),
+ (N'dbo.di_authChallenge'),
+ (N'dbo.di_databaseConfiguration'),
+ (N'dbo.di_flpConfiguration'),
+ (N'dbo.di_flpConfigurationSecurityGroupMapping'),
+ (N'dbo.di_gdrive_tenant'),
+ (N'dbo.di_group'),
+ (N'dbo.di_groupMembership'),
+ (N'dbo.di_groupRoleMapping'),
+ (N'dbo.di_groupScopeMapping'),
+ (N'dbo.di_info_clientnames'),
+ (N'dbo.di_info_databricksInstance'),
+ (N'dbo.di_info_permission'),
+ (N'dbo.di_info_region'),
+ (N'dbo.di_info_securityGroup'),
+ (N'dbo.di_info_storageAccountDetails'),
+ (N'dbo.di_info_sub_region'),
+ (N'dbo.di_role'),
+ (N'dbo.di_rolePermission'),
+ (N'dbo.di_userAccount'),
+ (N'dbo.di_userIdentity'),
+ (N'dbo.di_userLegacyLink'),
+ (N'dbo.di_userRoleMapping'),
+ (N'dbo.di_userSession')
+ ) required(ObjectName) WHERE OBJECT_ID(required.ObjectName) IS NULL)
+  THROW 51090,'A required Access or business catalogue object is missing. No updates applied.',1;
+
+ IF COL_LENGTH(N'dbo.di_info_permission',N'Description') IS NOT NULL
+ AND NOT EXISTS(SELECT 1 FROM sys.columns WHERE object_id=OBJECT_ID(N'dbo.di_info_permission')
+  AND name=N'Description' AND system_type_id=231 AND max_length=600 AND is_nullable=1 AND is_computed=0)
+  THROW 51090,'Existing permission Description column differs from expected nvarchar(300) NULL. Review before applying.',1;
+ IF COL_LENGTH(N'dbo.di_info_permission',N'Description') IS NULL
+  EXEC sys.sp_executesql N'ALTER TABLE dbo.di_info_permission ADD Description nvarchar(300) NULL;';
+
+ -- Source-request storage, defaults, primary key, check constraints, foreign keys and indexes.
+ EXEC sys.sp_executesql N'CREATE TABLE dbo.di_sourceSetupRequest (
+    [RequestId] bigint IDENTITY(1,1) NOT NULL,
+    [GroupId] uniqueidentifier NOT NULL,
+    [RequestedByUserId] uniqueidentifier NOT NULL,
+    [SourceKind] varchar(16) NOT NULL,
+    [DisplayName] nvarchar(120) NOT NULL,
+    [LocationUrl] nvarchar(512) NOT NULL,
+    [Details] nvarchar(1000) NULL,
+    [RegionId] int NOT NULL,
+    [SubRegionId] int NOT NULL,
+    [ClientId] int NOT NULL,
+    [RequestStatus] tinyint NOT NULL CONSTRAINT DF_access_di_sourceSetupRequest_RequestStatus DEFAULT (1),
+    [ResourceId] nvarchar(64) NULL,
+    [ResolutionNote] nvarchar(1000) NULL,
+    [ResolvedByUserId] uniqueidentifier NULL,
+    [CreatedAtUTC] datetime2(3) NOT NULL CONSTRAINT DF_access_di_sourceSetupRequest_CreatedAtUTC DEFAULT (SYSUTCDATETIME()),
+    [UpdatedAtUTC] datetime2(3) NULL,
+    [RowVersion] rowversion,
+    CONSTRAINT PK_access_di_sourceSetupRequest PRIMARY KEY (RequestId),
+    CONSTRAINT CK_accessSourceKind CHECK (SourceKind IN (''SHAREPOINT'',''GDRIVE'')),
+    CONSTRAINT CK_accessSourceRequestStatus CHECK (RequestStatus BETWEEN 1 AND 5)
+);
+
+ALTER TABLE dbo.di_sourceSetupRequest ADD CONSTRAINT FK_access_61 FOREIGN KEY (GroupId) REFERENCES dbo.di_group (GroupId) ON DELETE NO ACTION ON UPDATE NO ACTION;
+
+ALTER TABLE dbo.di_sourceSetupRequest ADD CONSTRAINT FK_access_62 FOREIGN KEY (RequestedByUserId) REFERENCES dbo.di_userAccount (UserId) ON DELETE NO ACTION ON UPDATE NO ACTION;
+
+ALTER TABLE dbo.di_sourceSetupRequest ADD CONSTRAINT FK_access_63 FOREIGN KEY (ResolvedByUserId) REFERENCES dbo.di_userAccount (UserId) ON DELETE NO ACTION ON UPDATE NO ACTION;
+
+CREATE INDEX IX_accessSourceRequestGroup ON dbo.di_sourceSetupRequest (GroupId,RequestId);
+
+CREATE INDEX IX_accessSourceRequestUser ON dbo.di_sourceSetupRequest (RequestedByUserId,GroupId,RequestId);';
+
+ -- dbo.commit_accessIdentity
+ EXEC sys.sp_executesql N'CREATE OR ALTER PROCEDURE dbo.commit_accessIdentity
+    @OperationId uniqueidentifier,
+    @RequestHash binary(32),
+    @CorrelationId uniqueidentifier,
+    @ExpectedRowVersion binary(8)=NULL,
+    @Command varchar(16),
+    @UserId uniqueidentifier=NULL,
+    @ProviderTypeId smallint,
+    @ProviderNamespace varchar(128),
+    @SubjectId varchar(255),
+    @VerifiedEmail nvarchar(320)=NULL,
+    @EmailVerified bit,
+    @DisplayName nvarchar(200),
+    @LinkChallengeId uniqueidentifier=NULL,
+    @CompanyDirectoryEligible bit=0
 AS
 BEGIN
- SET NOCOUNT ON; SET XACT_ABORT ON;
- BEGIN TRY
- BEGIN TRANSACTION;
- DECLARE @Permission varchar(100)=CASE
-   WHEN @View IN ('processes','extensions','dateformats') THEN 'PROCESS.LIST'
-   WHEN @View IN ('status','filedetail') THEN 'STATUS.VIEW'
-   WHEN @View='history' THEN 'HISTORY.VIEW'
-   WHEN @View IN ('processcounts','filecounts','clientcounts','recent','uploads','utilization','regions') THEN 'DASHBOARD.VIEW' END;
- IF @Permission IS NULL OR @Page NOT BETWEEN 1 AND 10000 OR @Take NOT BETWEEN 1 AND 100
-   THROW 51002,'ACCESS_APPLICATION_QUERY_INVALID',1;
- IF @SearchFields IS NOT NULL AND EXISTS(SELECT 1 FROM STRING_SPLIT(@SearchFields,',') WHERE value NOT IN('process','type','region','subregion','client','database','table','creator','ingestion','description','file','status')) THROW 51002,'ACCESS_APPLICATION_FILTER_INVALID',1;
- IF (@From IS NULL AND @To IS NOT NULL) OR (@To IS NULL AND @From IS NOT NULL)
-   OR @From>=@To OR @To>DATEADD(day,366,@From) THROW 51002,'ACCESS_APPLICATION_RANGE_INVALID',1;
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
     DECLARE @Now datetime2(3)=SYSUTCDATETIME();
-    IF NOT EXISTS (SELECT 1 FROM dbo.di_userSession s WITH(HOLDLOCK) JOIN dbo.di_userAccount u WITH(HOLDLOCK) ON u.UserId=s.UserId JOIN dbo.di_userIdentity i WITH(HOLDLOCK) ON i.IdentityId=s.IdentityId AND i.UserId=s.UserId WHERE s.SessionId=@ActorSessionId AND s.SessionHash=@SessionHash AND s.UserId=@ActorUserId AND s.RevokedAtUTC IS NULL AND s.AbsoluteExpiresAtUTC>@Now AND s.IdleExpiresAtUTC>@Now AND s.UserSecurityVersion=u.SecurityVersion AND u.AccountStatus=2 AND i.IdentityStatus=2) THROW 51001,'ACCESS_SESSION_INVALID',1;
+    IF ISNULL(IS_MEMBER(N''access_auth_executor''),0)<>1 AND ISNULL(IS_MEMBER(N''db_owner''),0)<>1 THROW 51003,''ACCESS_SERVICE_ROLE_REQUIRED'',1;
+
+    IF @OperationId IS NULL OR @RequestHash IS NULL OR @CorrelationId IS NULL THROW 51002,''ACCESS_COMMAND_METADATA_REQUIRED'',1;
+    BEGIN TRY
+      BEGIN TRANSACTION;
+
+      DECLARE @LockResult int;
+      DECLARE @LockName nvarchar(255)=N''DIAccessCommand:''+CONVERT(nvarchar(36),@OperationId);
+      EXEC @LockResult=sys.sp_getapplock @Resource=@LockName,@LockMode=''Exclusive'',@LockOwner=''Transaction'',@LockTimeout=5000;
+      IF @LockResult<0 THROW 51009,''ACCESS_COMMAND_BUSY'',1;
+      IF EXISTS (SELECT 1 FROM dbo.di_accessAudit WHERE OperationId=@OperationId AND EventSequence=0)
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM dbo.di_accessAudit WHERE OperationId=@OperationId AND EventSequence=0 AND RequestHash=@RequestHash AND EventCode=''commit_accessIdentity'' AND ActorServiceCode=''AUTH'') THROW 51004,''ACCESS_IDEMPOTENCY_CONFLICT'',1;
+        SELECT ''AlreadyApplied'' Disposition,TargetKey FROM dbo.di_accessAudit WHERE OperationId=@OperationId AND EventSequence=0;
+        COMMIT TRANSACTION; RETURN;
+      END;
+
+      IF @Command NOT IN (''RESOLVE'',''LINK'',''REGISTER'') THROW 51020,''ACCESS_PROVISIONING_REQUIRES_INVITATION'',1;
+      IF @ProviderTypeId NOT IN (1,2) OR LEN(@ProviderNamespace)=0 OR LEN(@SubjectId)=0 THROW 51002,''ACCESS_PROVIDER_IDENTITY_INVALID'',1;
+
+      IF @ProviderTypeId=2 AND (@ProviderNamespace NOT IN (''https://accounts.google.com'',''accounts.google.com'') OR @EmailVerified<>1 OR NULLIF(@VerifiedEmail,N'''') IS NULL)
+        THROW 51002,''ACCESS_PROVIDER_IDENTITY_INVALID'',1;
+      IF @ProviderTypeId=1 AND (TRY_CONVERT(uniqueidentifier,@ProviderNamespace) IS NULL OR TRY_CONVERT(uniqueidentifier,@SubjectId) IS NULL)
+        THROW 51002,''ACCESS_PROVIDER_IDENTITY_INVALID'',1;
+      DECLARE @IdentityId bigint,@ResolvedUserId uniqueidentifier;
+      DECLARE @IdentityLock nvarchar(255)=N''DIAccessIdentity:''+CONVERT(varchar(64),HASHBYTES(''SHA2_256'',CONCAT(@ProviderTypeId,'':'',CASE WHEN @ProviderTypeId=2 THEN ''https://accounts.google.com'' ELSE @ProviderNamespace END,'':'',@SubjectId)),2);
+      EXEC @LockResult=sys.sp_getapplock @Resource=@IdentityLock,@LockMode=''Exclusive'',@LockOwner=''Transaction'',@LockTimeout=5000;
+      IF @LockResult<0 THROW 51009,''ACCESS_COMMAND_BUSY'',1;
+      -- Google accepts two issuer spellings; never create a second account for the same sub.
+      IF @ProviderTypeId=2
+      BEGIN
+        IF (SELECT COUNT(*) FROM dbo.di_userIdentity WHERE ProviderTypeId=2 AND SubjectId=@SubjectId COLLATE Latin1_General_100_BIN2 AND ProviderNamespace IN (''https://accounts.google.com'',''accounts.google.com''))>1
+          THROW 51022,''ACCESS_IDENTITY_ALREADY_LINKED'',1;
+        SET @ProviderNamespace=COALESCE((SELECT ProviderNamespace FROM dbo.di_userIdentity WHERE ProviderTypeId=2 AND SubjectId=@SubjectId COLLATE Latin1_General_100_BIN2 AND ProviderNamespace IN (''https://accounts.google.com'',''accounts.google.com'')),''https://accounts.google.com'');
+      END;
+
+      SELECT @IdentityId=IdentityId,@ResolvedUserId=UserId FROM dbo.di_userIdentity WITH(UPDLOCK,HOLDLOCK) WHERE ProviderTypeId=@ProviderTypeId AND ProviderNamespace=@ProviderNamespace COLLATE Latin1_General_100_BIN2 AND SubjectId=@SubjectId COLLATE Latin1_General_100_BIN2;
+
+      IF @Command=''REGISTER''
+      BEGIN
+        IF @UserId IS NOT NULL OR @LinkChallengeId IS NOT NULL THROW 51002,''ACCESS_PROVIDER_IDENTITY_INVALID'',1;
+        IF @IdentityId IS NULL
+        BEGIN
+          SET @ResolvedUserId=NEWID();
+          INSERT dbo.di_userAccount(UserId,DisplayName,ContactEmail,IsExternal,PreferredProviderTypeId,AccountStatus)
+            VALUES(@ResolvedUserId,@DisplayName,CASE WHEN @EmailVerified=1 THEN @VerifiedEmail ELSE NULL END,CASE WHEN @CompanyDirectoryEligible=1 THEN 0 ELSE 1 END,@ProviderTypeId,2);
+          INSERT dbo.di_userIdentity(UserId,ProviderTypeId,ProviderNamespace,SubjectId,Email,EmailVerified,IdentityStatus,VerifiedAtUTC)
+            VALUES(@ResolvedUserId,@ProviderTypeId,@ProviderNamespace,@SubjectId,@VerifiedEmail,@EmailVerified,2,@Now);
+          SET @IdentityId=SCOPE_IDENTITY();
+        END;
+        -- No email-based merge, membership, role, bootstrap or legacy identity is created.
+      END;
+      IF @Command=''LINK''
+      BEGIN
+        IF @UserId IS NULL OR NOT EXISTS(SELECT 1 FROM dbo.di_authChallenge c JOIN dbo.di_userAccount u ON u.UserId=c.UserId WHERE c.ChallengeId=@LinkChallengeId AND c.UserId=@UserId AND c.PurposeCode IN (1,6) AND c.ChallengeStatus=1 AND c.ExpiresAtUTC>@Now AND c.RequiredUserSecurityVersion=u.SecurityVersion AND u.AccountStatus IN (1,2)) THROW 51021,''ACCESS_LINK_PROOF_REQUIRED'',1;
+        IF @IdentityId IS NOT NULL AND @ResolvedUserId<>@UserId THROW 51022,''ACCESS_IDENTITY_ALREADY_LINKED'',1;
+        IF @IdentityId IS NULL
+        BEGIN
+          INSERT dbo.di_userIdentity(UserId,ProviderTypeId,ProviderNamespace,SubjectId,Email,EmailVerified,IdentityStatus,VerifiedAtUTC) VALUES(@UserId,@ProviderTypeId,@ProviderNamespace,@SubjectId,@VerifiedEmail,@EmailVerified,2,@Now);
+          SET @IdentityId=SCOPE_IDENTITY(); SET @ResolvedUserId=@UserId;
+        END;
+        UPDATE dbo.di_authChallenge SET ChallengeStatus=2,ConsumedAtUTC=@Now WHERE ChallengeId=@LinkChallengeId AND ChallengeStatus=1;
+        IF @@ROWCOUNT<>1 THROW 51021,''ACCESS_LINK_PROOF_USED'',1;
+        UPDATE dbo.di_userAccount SET AccountStatus=2,ModificationDateTime=@Now WHERE UserId=@UserId AND AccountStatus=1;
+      END;
+      IF @IdentityId IS NULL THROW 51023,''ACCESS_IDENTITY_NOT_REGISTERED'',1;
+      IF NOT EXISTS(SELECT 1 FROM dbo.di_userIdentity i JOIN dbo.di_userAccount u ON u.UserId=i.UserId WHERE i.IdentityId=@IdentityId AND i.IdentityStatus=2 AND u.AccountStatus=2) THROW 51024,''ACCESS_ACCOUNT_DISABLED'',1;
+      UPDATE dbo.di_userIdentity SET VerifiedAtUTC=@Now,Email=@VerifiedEmail,EmailVerified=@EmailVerified,ModificationDateTime=@Now WHERE IdentityId=@IdentityId;
+      SELECT u.UserId,i.IdentityId,u.AccountStatus,i.IdentityStatus,u.SecurityVersion,u.IsExternal,u.DisplayName,i.Email,i.EmailVerified,i.ProviderTypeId,i.ProviderNamespace,i.SubjectId,u.RowVersion FROM dbo.di_userIdentity i JOIN dbo.di_userAccount u ON u.UserId=i.UserId WHERE i.IdentityId=@IdentityId;
+
+      INSERT dbo.di_accessAudit(OperationId,RequestHash,ActorUserId,ActorServiceCode,GroupId,EventCode,TargetType,TargetKey,Outcome,ChangeSummary,CorrelationId)
+      VALUES(@OperationId,@RequestHash,NULL,''AUTH'',NULL,''commit_accessIdentity'',''ACCESS'',COALESCE(CONVERT(nvarchar(200),@ResolvedUserId),N''''),1,N''Command=''+@Command,@CorrelationId);
+      COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+      IF XACT_STATE()<>0 ROLLBACK TRANSACTION;
+      THROW;
+    END CATCH;
+END;';
+
+ -- dbo.commit_accessPermissionCatalog
+ EXEC sys.sp_executesql N'CREATE OR ALTER PROCEDURE dbo.commit_accessPermissionCatalog
+    @ActorUserId uniqueidentifier,
+    @ActorSessionId uniqueidentifier,
+    @SessionHash binary(32),
+    @OperationId uniqueidentifier,
+    @RequestHash binary(32),
+    @CorrelationId uniqueidentifier,
+    @ExpectedRowVersion binary(8)=NULL,
+    @PermissionId int=NULL,
+    @PermissionCode varchar(100),
+    @ParentPermissionId int=NULL,
+    @NodeKind char(1),
+    @DisplayName nvarchar(120),
+    @RouteKey varchar(100)=NULL,
+    @IconKey varchar(100)=NULL,
+    @SortOrder int,
+    @AllowedScopeMask int,
+    @IsActive bit,
+    @Command varchar(10)=''UPDATE'',
+    @Description nvarchar(300)=NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    DECLARE @Now datetime2(3)=SYSUTCDATETIME();
+    IF @OperationId IS NULL OR @RequestHash IS NULL OR @CorrelationId IS NULL THROW 51002,''ACCESS_COMMAND_METADATA_REQUIRED'',1;
+    BEGIN TRY
+      BEGIN TRANSACTION;
+    IF NOT EXISTS (SELECT 1 FROM dbo.di_userSession s WITH(HOLDLOCK) JOIN dbo.di_userAccount u WITH(HOLDLOCK) ON u.UserId=s.UserId JOIN dbo.di_userIdentity i WITH(HOLDLOCK) ON i.IdentityId=s.IdentityId AND i.UserId=s.UserId WHERE s.SessionId=@ActorSessionId AND s.SessionHash=@SessionHash AND s.UserId=@ActorUserId AND s.RevokedAtUTC IS NULL AND s.AbsoluteExpiresAtUTC>@Now AND s.IdleExpiresAtUTC>@Now AND s.UserSecurityVersion=u.SecurityVersion AND u.AccountStatus=2 AND i.IdentityStatus=2) THROW 51001,''ACCESS_SESSION_INVALID'',1;
+    DECLARE @ScopeGroupId uniqueidentifier=NULL;
+    DECLARE @AccessPermissions TABLE(PermissionCode varchar(100) PRIMARY KEY,DataScopeCode tinyint NOT NULL);
+    ;WITH EligibleRoles AS (
+      SELECT ur.RoleId,r.Priority FROM dbo.di_userRoleMapping ur WITH(HOLDLOCK) JOIN dbo.di_role r WITH(HOLDLOCK) ON r.RoleId=ur.RoleId AND r.IsActive=1
+      WHERE ur.UserId=@ActorUserId AND ur.IsActive=1 AND ur.BeginsAtUTC<=@Now AND (ur.EndsAtUTC IS NULL OR ur.EndsAtUTC>@Now)
+      AND ((ur.GrantScope=''A'' AND ur.RoleId IN (4,5)) OR (ur.GrantScope=''G'' AND ur.GroupId=@ScopeGroupId AND EXISTS (
+        SELECT 1 FROM dbo.di_groupMembership m WITH(HOLDLOCK) JOIN dbo.di_group g WITH(HOLDLOCK) ON g.GroupId=m.GroupId JOIN dbo.di_userAccount u WITH(HOLDLOCK) ON u.UserId=m.UserId LEFT JOIN dbo.di_userIdentity pi WITH(HOLDLOCK) ON pi.IdentityId=m.ProofIdentityId
+        JOIN dbo.di_groupRoleMapping gr WITH(HOLDLOCK) ON gr.GroupId=m.GroupId AND gr.RoleId=ur.RoleId AND gr.IsActive=1
+        WHERE m.MembershipId=ur.MembershipId AND m.UserId=ur.UserId AND ur.GrantMembershipEpoch=m.MembershipEpoch AND m.LocalState=1 AND m.ApprovalStatus IN (0,2,4) AND g.GroupStatus=2 AND (u.IsExternal=0 OR g.ProviderTypeId=3) AND (g.ProviderTypeId=3 OR (m.ProofStatus=1 AND m.ProofExpiresAtUTC>@Now AND m.ProofObservedAtUTC>=DATEADD(minute,-15,@Now) AND pi.IdentityStatus=2 AND pi.UserId=m.UserId AND pi.ProviderTypeId=g.ProviderTypeId AND ((g.ProviderTypeId=1 AND pi.ProviderNamespace=g.DirectoryKey) OR (g.ProviderTypeId=2 AND pi.ProviderNamespace IN (''https://accounts.google.com'',''accounts.google.com''))))))))
+      AND (@ScopeGroupId IS NULL OR EXISTS (SELECT 1 FROM dbo.di_group g JOIN dbo.di_userAccount u ON u.UserId=@ActorUserId WHERE g.GroupId=@ScopeGroupId AND g.GroupStatus<>4 AND (u.IsExternal=0 OR g.ProviderTypeId=3)))
+    ), Chosen AS (SELECT RoleId FROM EligibleRoles WHERE Priority=(SELECT MAX(Priority) FROM EligibleRoles))
+    INSERT @AccessPermissions SELECT p.PermissionCode,MAX(rp.DataScopeCode) FROM Chosen c JOIN dbo.di_rolePermission rp WITH(HOLDLOCK) ON rp.RoleId=c.RoleId AND rp.IsActive=1 JOIN dbo.di_info_permission p WITH(HOLDLOCK) ON p.PermissionId=rp.PermissionId AND p.IsActive=1 GROUP BY p.PermissionCode;
+    IF NOT EXISTS (SELECT 1 FROM @AccessPermissions WHERE PermissionCode=''PERMISSION.MANAGE'') THROW 51003,''ACCESS_PERMISSION_DENIED'',1;
+
+      DECLARE @LockResult int;
+      DECLARE @LockName nvarchar(255)=N''DIAccessCommand:''+CONVERT(nvarchar(36),@OperationId);
+      EXEC @LockResult=sys.sp_getapplock @Resource=@LockName,@LockMode=''Exclusive'',@LockOwner=''Transaction'',@LockTimeout=5000;
+      IF @LockResult<0 THROW 51009,''ACCESS_COMMAND_BUSY'',1;
+      IF EXISTS (SELECT 1 FROM dbo.di_accessAudit WHERE OperationId=@OperationId AND EventSequence=0)
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM dbo.di_accessAudit WHERE OperationId=@OperationId AND EventSequence=0 AND RequestHash=@RequestHash AND EventCode=''commit_accessPermissionCatalog'' AND ActorUserId=@ActorUserId) THROW 51004,''ACCESS_IDEMPOTENCY_CONFLICT'',1;
+        SELECT ''AlreadyApplied'' Disposition,TargetKey FROM dbo.di_accessAudit WHERE OperationId=@OperationId AND EventSequence=0;
+        COMMIT TRANSACTION; RETURN;
+      END;
+
+
+      IF @Command NOT IN (''CREATE'',''UPDATE'',''REMOVE'',''ASSET'') THROW 51002,''ACCESS_MENU_COMMAND_INVALID'',1;
+      IF @Command=''ASSET''
+      BEGIN
+        IF @IconKey IS NULL OR LEN(@IconKey)<>74 OR LEFT(@IconKey,6)<>''asset-'' OR RIGHT(@IconKey,4)<>''.png'' OR SUBSTRING(@IconKey,7,64) COLLATE Latin1_General_100_BIN2 LIKE ''%[^0-9a-f]%''
+          THROW 51002,''ACCESS_ICON_NOT_ALLOWLISTED'',1;
+        SELECT @IconKey AS IconKey;
+      END
+      ELSE
+      BEGIN
+        IF NULLIF(LTRIM(RTRIM(@DisplayName)),N'''') IS NULL OR @SortOrder NOT BETWEEN 0 AND 100000 THROW 51002,''ACCESS_MENU_PRESENTATION_INVALID'',1;
+        IF @IconKey IS NOT NULL AND @IconKey NOT IN (''dashboard'',''process'',''monitor'',''administration'',''groups'',''users'',''permissions'',''source'',''reports'',''settings'')
+          AND NOT EXISTS(SELECT 1 FROM dbo.di_accessAudit WHERE EventCode=''commit_accessPermissionCatalog'' AND TargetKey=@IconKey AND ChangeSummary=N''Command=ASSET'' AND Outcome=1)
+          THROW 51002,''ACCESS_ICON_NOT_ALLOWLISTED'',1;
+        IF @Command=''CREATE''
+        BEGIN
+          IF @PermissionId IS NOT NULL OR @NodeKind NOT IN (''N'',''M'') OR @AllowedScopeMask<>1 OR @IsActive<>1
+            OR @PermissionCode NOT LIKE ''MENU.CUSTOM.%'' OR LEN(@PermissionCode)>100 THROW 51002,''ACCESS_CUSTOM_MENU_INVALID'',1;
+          IF (@NodeKind=''N'' AND (@ParentPermissionId IS NOT NULL OR @RouteKey IS NOT NULL)) OR
+            (@NodeKind=''M'' AND (@RouteKey IS NULL OR @RouteKey NOT IN (''dashboard'',''process-list'',''real-time-status'',''processed-files'',''access-users'',''access-groups'',''access-approvals'',''access-role-assignments'',''access-role-permissions'',''source-connect''))) THROW 51002,''ACCESS_MENU_ROUTE_NOT_REVIEWED'',1;
+          IF @ParentPermissionId IS NOT NULL AND NOT EXISTS(SELECT 1 FROM dbo.di_info_permission WHERE PermissionId=@ParentPermissionId AND NodeKind=''N'' AND IsActive=1) THROW 51002,''ACCESS_MENU_PARENT_INVALID'',1;
+          INSERT dbo.di_info_permission(PermissionCode,ParentPermissionId,NodeKind,DisplayName,RouteKey,IconKey,Description,SortOrder,AllowedScopeMask,IsActive,CreatedByUserId)
+          VALUES(@PermissionCode,@ParentPermissionId,@NodeKind,LTRIM(RTRIM(@DisplayName)),@RouteKey,@IconKey,@Description,@SortOrder,1,1,@ActorUserId);
+          SET @PermissionId=SCOPE_IDENTITY();
+          -- Presentation creation does not grant this menu or any executable action to any role.
+        END
+        ELSE
+        BEGIN
+          IF @PermissionId IS NULL OR @ExpectedRowVersion IS NULL THROW 51002,''ACCESS_EXISTING_ALLOWLIST_KEY_REQUIRED'',1;
+          IF NOT EXISTS(SELECT 1 FROM dbo.di_info_permission WITH(UPDLOCK,HOLDLOCK) WHERE PermissionId=@PermissionId AND PermissionCode=@PermissionCode AND RowVersion=@ExpectedRowVersion AND NodeKind=@NodeKind AND ISNULL(ParentPermissionId,0)=ISNULL(@ParentPermissionId,0) AND ISNULL(RouteKey,'''')=ISNULL(@RouteKey,'''') AND AllowedScopeMask=@AllowedScopeMask)
+            THROW 51005,''ACCESS_CONCURRENCY_CONFLICT'',1;
+          IF @NodeKind=''A'' OR (@Command=''REMOVE'' AND @NodeKind=''N'' AND EXISTS(SELECT 1 FROM dbo.di_info_permission WHERE ParentPermissionId=@PermissionId AND IsActive=1)) THROW 51003,''ACCESS_EXECUTABLE_CATALOG_IMMUTABLE'',1;
+          UPDATE dbo.di_info_permission SET DisplayName=LTRIM(RTRIM(@DisplayName)),IconKey=@IconKey,Description=COALESCE(@Description,Description),SortOrder=@SortOrder,IsActive=CASE WHEN @Command=''REMOVE'' THEN 0 ELSE @IsActive END,ModificationDateTime=@Now,ModifiedByUserId=@ActorUserId WHERE PermissionId=@PermissionId;
+        END;
+        UPDATE dbo.di_role SET PolicyVersion=PolicyVersion+1,ModificationDateTime=@Now WHERE RoleId IN (SELECT RoleId FROM dbo.di_rolePermission WHERE PermissionId=@PermissionId);
+        SELECT PermissionId,PermissionCode,DisplayName,Description,IsActive,RowVersion FROM dbo.di_info_permission WHERE PermissionId=@PermissionId;
+      END;
+
+      INSERT dbo.di_accessAudit(OperationId,RequestHash,ActorUserId,ActorServiceCode,GroupId,EventCode,TargetType,TargetKey,Outcome,ChangeSummary,CorrelationId)
+      VALUES(@OperationId,@RequestHash,@ActorUserId,NULL,NULL,''commit_accessPermissionCatalog'',''ACCESS'',CASE WHEN @Command=''ASSET'' THEN @IconKey ELSE CONVERT(nvarchar(200),@PermissionId) END,1,N''Command=''+@Command,@CorrelationId);
+      COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+      IF XACT_STATE()<>0 ROLLBACK TRANSACTION;
+      THROW;
+    END CATCH;
+END;';
+
+ -- dbo.sel_accessGroupMappings
+ EXEC sys.sp_executesql N'CREATE OR ALTER PROCEDURE dbo.sel_accessGroupMappings
+    @ActorUserId uniqueidentifier,
+    @ActorSessionId uniqueidentifier,
+    @SessionHash binary(32),
+    @GroupId uniqueidentifier,
+    @MappingKind char(1),
+    @AfterMappingId bigint=NULL,
+    @Take int=50,
+    @CatalogKind varchar(16)=NULL,
+    @Search nvarchar(100)=NULL,
+    @ParentId int=NULL,
+    @AfterValue nvarchar(64)=NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    DECLARE @Now datetime2(3)=SYSUTCDATETIME();
+    IF NOT EXISTS (SELECT 1 FROM dbo.di_userSession s WITH(HOLDLOCK) JOIN dbo.di_userAccount u WITH(HOLDLOCK) ON u.UserId=s.UserId JOIN dbo.di_userIdentity i WITH(HOLDLOCK) ON i.IdentityId=s.IdentityId AND i.UserId=s.UserId WHERE s.SessionId=@ActorSessionId AND s.SessionHash=@SessionHash AND s.UserId=@ActorUserId AND s.RevokedAtUTC IS NULL AND s.AbsoluteExpiresAtUTC>@Now AND s.IdleExpiresAtUTC>@Now AND s.UserSecurityVersion=u.SecurityVersion AND u.AccountStatus=2 AND i.IdentityStatus=2) THROW 51001,''ACCESS_SESSION_INVALID'',1;
     DECLARE @ScopeGroupId uniqueidentifier=@GroupId;
     DECLARE @AccessPermissions TABLE(PermissionCode varchar(100) PRIMARY KEY,DataScopeCode tinyint NOT NULL);
     ;WITH EligibleRoles AS (
       SELECT ur.RoleId,r.Priority FROM dbo.di_userRoleMapping ur WITH(HOLDLOCK) JOIN dbo.di_role r WITH(HOLDLOCK) ON r.RoleId=ur.RoleId AND r.IsActive=1
       WHERE ur.UserId=@ActorUserId AND ur.IsActive=1 AND ur.BeginsAtUTC<=@Now AND (ur.EndsAtUTC IS NULL OR ur.EndsAtUTC>@Now)
-      AND ((ur.GrantScope='A' AND ur.RoleId IN (4,5)) OR (ur.GrantScope='G' AND ur.GroupId=@ScopeGroupId AND EXISTS (
+      AND ((ur.GrantScope=''A'' AND ur.RoleId IN (4,5)) OR (ur.GrantScope=''G'' AND ur.GroupId=@ScopeGroupId AND EXISTS (
         SELECT 1 FROM dbo.di_groupMembership m WITH(HOLDLOCK) JOIN dbo.di_group g WITH(HOLDLOCK) ON g.GroupId=m.GroupId JOIN dbo.di_userAccount u WITH(HOLDLOCK) ON u.UserId=m.UserId LEFT JOIN dbo.di_userIdentity pi WITH(HOLDLOCK) ON pi.IdentityId=m.ProofIdentityId
         JOIN dbo.di_groupRoleMapping gr WITH(HOLDLOCK) ON gr.GroupId=m.GroupId AND gr.RoleId=ur.RoleId AND gr.IsActive=1
-        WHERE m.MembershipId=ur.MembershipId AND m.UserId=ur.UserId AND ur.GrantMembershipEpoch=m.MembershipEpoch AND m.LocalState=1 AND m.ApprovalStatus IN (0,2,4) AND g.GroupStatus=2 AND (u.IsExternal=0 OR g.ProviderTypeId=3) AND (g.ProviderTypeId=3 OR (m.ProofStatus=1 AND m.ProofExpiresAtUTC>@Now AND m.ProofObservedAtUTC>=DATEADD(minute,-15,@Now) AND pi.IdentityStatus=2 AND pi.UserId=m.UserId AND pi.ProviderTypeId=g.ProviderTypeId AND ((g.ProviderTypeId=1 AND pi.ProviderNamespace=g.DirectoryKey) OR (g.ProviderTypeId=2 AND pi.ProviderNamespace IN ('https://accounts.google.com','accounts.google.com'))))))))
+        WHERE m.MembershipId=ur.MembershipId AND m.UserId=ur.UserId AND ur.GrantMembershipEpoch=m.MembershipEpoch AND m.LocalState=1 AND m.ApprovalStatus IN (0,2,4) AND g.GroupStatus=2 AND (u.IsExternal=0 OR g.ProviderTypeId=3) AND (g.ProviderTypeId=3 OR (m.ProofStatus=1 AND m.ProofExpiresAtUTC>@Now AND m.ProofObservedAtUTC>=DATEADD(minute,-15,@Now) AND pi.IdentityStatus=2 AND pi.UserId=m.UserId AND pi.ProviderTypeId=g.ProviderTypeId AND ((g.ProviderTypeId=1 AND pi.ProviderNamespace=g.DirectoryKey) OR (g.ProviderTypeId=2 AND pi.ProviderNamespace IN (''https://accounts.google.com'',''accounts.google.com''))))))))
       AND (@ScopeGroupId IS NULL OR EXISTS (SELECT 1 FROM dbo.di_group g JOIN dbo.di_userAccount u ON u.UserId=@ActorUserId WHERE g.GroupId=@ScopeGroupId AND g.GroupStatus<>4 AND (u.IsExternal=0 OR g.ProviderTypeId=3)))
     ), Chosen AS (SELECT RoleId FROM EligibleRoles WHERE Priority=(SELECT MAX(Priority) FROM EligibleRoles))
     INSERT @AccessPermissions SELECT p.PermissionCode,MAX(rp.DataScopeCode) FROM Chosen c JOIN dbo.di_rolePermission rp WITH(HOLDLOCK) ON rp.RoleId=c.RoleId AND rp.IsActive=1 JOIN dbo.di_info_permission p WITH(HOLDLOCK) ON p.PermissionId=rp.PermissionId AND p.IsActive=1 GROUP BY p.PermissionCode;
-    IF NOT EXISTS (SELECT 1 FROM @AccessPermissions WHERE PermissionCode=@Permission) THROW 51003,'ACCESS_PERMISSION_DENIED',1;
 
+
+    IF @Take NOT BETWEEN 1 AND 100 OR @MappingKind NOT IN (''R'',''S'',''C'') THROW 51002,''ACCESS_PAGE_OR_KIND_INVALID'',1;
+    IF NOT EXISTS(SELECT 1 FROM @AccessPermissions WHERE PermissionCode IN (''POLICY.REGION'',''POLICY.RESOURCE'')) THROW 51003,''ACCESS_PERMISSION_DENIED'',1;
+
+    -- #region Approved catalogue IDs and labels; no credentials or configuration bodies.
+    IF @MappingKind=''C''
+    BEGIN
+      IF @CatalogKind NOT IN (''REGION'',''SUBREGION'',''CLIENT'',''DATABASE'',''STORAGE'',''DATABRICKS'',''SHAREPOINT'',''GDRIVE'') OR @CatalogKind IS NULL
+        THROW 51002,''ACCESS_CATALOGUE_KIND_INVALID'',1;
+      IF NOT EXISTS(SELECT 1 FROM @AccessPermissions WHERE PermissionCode=CASE WHEN @CatalogKind IN (''REGION'',''SUBREGION'',''CLIENT'') THEN ''POLICY.REGION'' ELSE ''POLICY.RESOURCE'' END)
+        THROW 51003,''ACCESS_PERMISSION_DENIED'',1;
+      SET @Search=LTRIM(RTRIM(ISNULL(@Search,N'''')));
+      DECLARE @SearchPattern nvarchar(201)=REPLACE(REPLACE(REPLACE(REPLACE(@Search,N''\'',N''\\''),N''%'',N''\%''),N''_'',N''\_''),N''['',N''\['')+N''%'';
+      IF @CatalogKind IN (''REGION'',''SUBREGION'',''CLIENT'',''DATABASE'',''STORAGE'',''DATABRICKS'')
+        AND @AfterValue IS NOT NULL AND TRY_CONVERT(int,@AfterValue) IS NULL THROW 51002,''ACCESS_CATALOGUE_CURSOR_INVALID'',1;
+      IF @CatalogKind IN (''SHAREPOINT'',''GDRIVE'') AND @AfterValue IS NOT NULL AND TRY_CONVERT(uniqueidentifier,@AfterValue) IS NULL THROW 51002,''ACCESS_CATALOGUE_CURSOR_INVALID'',1;
+      IF @CatalogKind=''REGION''
+        SELECT TOP(@Take) CONVERT(nvarchar(64),Id) AS Value,Name AS Label,NULL AS ParentValue
+        FROM dbo.di_info_region WHERE active=1 AND (@AfterValue IS NULL OR Id>CONVERT(int,@AfterValue)) AND Name LIKE @SearchPattern ESCAPE N''\'' ORDER BY Id;
+      IF @CatalogKind=''SUBREGION''
+        SELECT TOP(@Take) CONVERT(nvarchar(64),Id) AS Value,Name AS Label,CONVERT(nvarchar(64),regionId) AS ParentValue
+        FROM dbo.di_info_sub_region WHERE active=1 AND (@ParentId IS NULL OR regionId=@ParentId) AND (@AfterValue IS NULL OR Id>CONVERT(int,@AfterValue)) AND Name LIKE @SearchPattern ESCAPE N''\'' ORDER BY Id;
+      IF @CatalogKind=''CLIENT''
+        SELECT TOP(@Take) CONVERT(nvarchar(64),Id) AS Value,Name AS Label,NULL AS ParentValue
+        FROM dbo.di_info_clientnames WHERE active=1 AND (@AfterValue IS NULL OR Id>CONVERT(int,@AfterValue)) AND Name LIKE @SearchPattern ESCAPE N''\'' ORDER BY Id;
+      IF @CatalogKind=''DATABASE''
+        SELECT TOP(@Take) CONVERT(nvarchar(64),id) AS Value,databaseName AS Label,NULL AS ParentValue
+        FROM dbo.di_databaseConfiguration WHERE active=1 AND (@AfterValue IS NULL OR id>CONVERT(int,@AfterValue)) AND databaseName LIKE @SearchPattern ESCAPE N''\'' ORDER BY id;
+      IF @CatalogKind=''STORAGE''
+        SELECT TOP(@Take) CONVERT(nvarchar(64),storageAccountId) AS Value,displayName AS Label,NULL AS ParentValue
+        FROM dbo.di_info_storageAccountDetails WHERE active=1 AND (@AfterValue IS NULL OR storageAccountId>CONVERT(int,@AfterValue)) AND displayName LIKE @SearchPattern ESCAPE N''\'' ORDER BY storageAccountId;
+      IF @CatalogKind=''DATABRICKS''
+        SELECT TOP(@Take) CONVERT(nvarchar(64),id) AS Value,instanceName AS Label,NULL AS ParentValue
+        FROM dbo.di_info_databricksInstance WHERE active=1 AND (@AfterValue IS NULL OR id>CONVERT(int,@AfterValue)) AND instanceName LIKE @SearchPattern ESCAPE N''\'' ORDER BY id;
+      IF @CatalogKind=''SHAREPOINT''
+        SELECT TOP(@Take) CONVERT(nvarchar(64),applicationid) AS Value,displayname AS Label,NULL AS ParentValue
+        FROM dbo.di_application WHERE isactive=1 AND deletedon IS NULL AND ISNULL(isdraft,0)=0 AND (@AfterValue IS NULL OR applicationid>CONVERT(uniqueidentifier,@AfterValue)) AND displayname LIKE @SearchPattern ESCAPE N''\'' ORDER BY applicationid;
+      IF @CatalogKind=''GDRIVE''
+        SELECT TOP(@Take) CONVERT(nvarchar(64),tenantid) AS Value,displayname AS Label,NULL AS ParentValue
+        FROM dbo.di_gdrive_tenant WHERE isactive=1 AND ISNULL(isdraft,0)=0 AND (@AfterValue IS NULL OR tenantid>CONVERT(uniqueidentifier,@AfterValue)) AND displayname LIKE @SearchPattern ESCAPE N''\'' ORDER BY tenantid;
+      RETURN;
+    END;
+    -- #endregion
+
+    BEGIN TRY
+    BEGIN TRANSACTION;
+    DECLARE @ReadPolicyVersion bigint;
+    SELECT @ReadPolicyVersion=PolicyVersion FROM dbo.di_group WITH(HOLDLOCK) WHERE GroupId=@GroupId;
+    SELECT TOP(@Take) m.MappingId,m.GroupId,m.ScopeKind,m.ScopeKind AS ResourceKind,m.RegionId,m.SubRegionId,m.ClientId,
+      m.DatabaseConfigurationId,m.StorageAccountRowId,m.DatabricksInstanceRowId,m.SharePointApplicationId,m.GoogleDriveTenantId,
+      m.CanUse,m.CanManage,m.IsActive,m.RowVersion,r.Name AS RegionName,s.Name AS SubRegionName,c.Name AS ClientName,
+      CASE m.ScopeKind WHEN ''DATABASE'' THEN db.databaseName WHEN ''STORAGE'' THEN st.displayName WHEN ''DATABRICKS'' THEN dt.instanceName
+        WHEN ''SHAREPOINT'' THEN sp.displayname WHEN ''GDRIVE'' THEN gd.displayname END AS ResourceName
+    FROM dbo.di_groupScopeMapping m
+    LEFT JOIN dbo.di_info_region r ON r.Id=m.RegionId
+    LEFT JOIN dbo.di_info_sub_region s ON s.Id=m.SubRegionId AND s.regionId=m.RegionId
+    LEFT JOIN dbo.di_info_clientnames c ON c.Id=m.ClientId
+    LEFT JOIN dbo.di_databaseConfiguration db ON db.id=m.DatabaseConfigurationId
+    LEFT JOIN dbo.di_info_storageAccountDetails st ON st.storageAccountId=m.StorageAccountRowId
+    LEFT JOIN dbo.di_info_databricksInstance dt ON dt.id=m.DatabricksInstanceRowId
+    LEFT JOIN dbo.di_application sp ON sp.applicationid=m.SharePointApplicationId
+    LEFT JOIN dbo.di_gdrive_tenant gd ON gd.tenantid=m.GoogleDriveTenantId
+    WHERE m.GroupId=@GroupId AND m.IsActive=1 AND ((@MappingKind=''R'' AND m.ScopeKind=''REGION'') OR (@MappingKind=''S'' AND m.ScopeKind<>''REGION''))
+      AND (@AfterMappingId IS NULL OR m.MappingId>@AfterMappingId) ORDER BY m.MappingId;
+
+    SELECT @ReadPolicyVersion AS PolicyVersion;
+    COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+      IF XACT_STATE()<>0 ROLLBACK TRANSACTION;
+      THROW;
+    END CATCH;
+
+END;
+';
+
+ -- dbo.sel_accessProcessList
+ EXEC sys.sp_executesql N'CREATE OR ALTER PROCEDURE dbo.sel_accessProcessList
+    @ActorUserId uniqueidentifier,
+    @ActorSessionId uniqueidentifier,
+    @SessionHash binary(32),
+    @ViewMode char(1)=''G'',
+    @GroupId uniqueidentifier=NULL,
+    @AfterProcessId nvarchar(100)=NULL,
+    @Take int=50,
+    @IncludeInactive bit=0
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    BEGIN TRY
+    BEGIN TRANSACTION;
+    DECLARE @Now datetime2(3)=SYSUTCDATETIME();
+    IF NOT EXISTS (SELECT 1 FROM dbo.di_userSession s WITH(HOLDLOCK) JOIN dbo.di_userAccount u WITH(HOLDLOCK) ON u.UserId=s.UserId JOIN dbo.di_userIdentity i WITH(HOLDLOCK) ON i.IdentityId=s.IdentityId AND i.UserId=s.UserId WHERE s.SessionId=@ActorSessionId AND s.SessionHash=@SessionHash AND s.UserId=@ActorUserId AND s.RevokedAtUTC IS NULL AND s.AbsoluteExpiresAtUTC>@Now AND s.IdleExpiresAtUTC>@Now AND s.UserSecurityVersion=u.SecurityVersion AND u.AccountStatus=2 AND i.IdentityStatus=2) THROW 51001,''ACCESS_SESSION_INVALID'',1;
+    DECLARE @ScopeGroupId uniqueidentifier=@GroupId;
+    DECLARE @AccessPermissions TABLE(PermissionCode varchar(100) PRIMARY KEY,DataScopeCode tinyint NOT NULL);
+    ;WITH EligibleRoles AS (
+      SELECT ur.RoleId,r.Priority FROM dbo.di_userRoleMapping ur WITH(HOLDLOCK) JOIN dbo.di_role r WITH(HOLDLOCK) ON r.RoleId=ur.RoleId AND r.IsActive=1
+      WHERE ur.UserId=@ActorUserId AND ur.IsActive=1 AND ur.BeginsAtUTC<=@Now AND (ur.EndsAtUTC IS NULL OR ur.EndsAtUTC>@Now)
+      AND ((ur.GrantScope=''A'' AND ur.RoleId IN (4,5)) OR (ur.GrantScope=''G'' AND ur.GroupId=@ScopeGroupId AND EXISTS (
+        SELECT 1 FROM dbo.di_groupMembership m WITH(HOLDLOCK) JOIN dbo.di_group g WITH(HOLDLOCK) ON g.GroupId=m.GroupId JOIN dbo.di_userAccount u WITH(HOLDLOCK) ON u.UserId=m.UserId LEFT JOIN dbo.di_userIdentity pi WITH(HOLDLOCK) ON pi.IdentityId=m.ProofIdentityId
+        JOIN dbo.di_groupRoleMapping gr WITH(HOLDLOCK) ON gr.GroupId=m.GroupId AND gr.RoleId=ur.RoleId AND gr.IsActive=1
+        WHERE m.MembershipId=ur.MembershipId AND m.UserId=ur.UserId AND ur.GrantMembershipEpoch=m.MembershipEpoch AND m.LocalState=1 AND m.ApprovalStatus IN (0,2,4) AND g.GroupStatus=2 AND (u.IsExternal=0 OR g.ProviderTypeId=3) AND (g.ProviderTypeId=3 OR (m.ProofStatus=1 AND m.ProofExpiresAtUTC>@Now AND m.ProofObservedAtUTC>=DATEADD(minute,-15,@Now) AND pi.IdentityStatus=2 AND pi.UserId=m.UserId AND pi.ProviderTypeId=g.ProviderTypeId AND ((g.ProviderTypeId=1 AND pi.ProviderNamespace=g.DirectoryKey) OR (g.ProviderTypeId=2 AND pi.ProviderNamespace IN (''https://accounts.google.com'',''accounts.google.com''))))))))
+      AND (@ScopeGroupId IS NULL OR EXISTS (SELECT 1 FROM dbo.di_group g JOIN dbo.di_userAccount u ON u.UserId=@ActorUserId WHERE g.GroupId=@ScopeGroupId AND g.GroupStatus<>4 AND (u.IsExternal=0 OR g.ProviderTypeId=3)))
+    ), Chosen AS (SELECT RoleId FROM EligibleRoles WHERE Priority=(SELECT MAX(Priority) FROM EligibleRoles))
+    INSERT @AccessPermissions SELECT p.PermissionCode,MAX(rp.DataScopeCode) FROM Chosen c JOIN dbo.di_rolePermission rp WITH(HOLDLOCK) ON rp.RoleId=c.RoleId AND rp.IsActive=1 JOIN dbo.di_info_permission p WITH(HOLDLOCK) ON p.PermissionId=rp.PermissionId AND p.IsActive=1 GROUP BY p.PermissionCode;
+    IF NOT EXISTS (SELECT 1 FROM @AccessPermissions WHERE PermissionCode=''PROCESS.LIST'') THROW 51003,''ACCESS_PERMISSION_DENIED'',1;
 
 
     -- #region Read-only business access: scope before projection, paging and aggregation
-    DECLARE @DataScope tinyint=(SELECT DataScopeCode FROM @AccessPermissions WHERE PermissionCode=@Permission);
-    IF @ViewMode IS NULL OR @ViewMode NOT IN ('G','A') OR (@ViewMode='G' AND @GroupId IS NULL) OR (@ViewMode='A' AND @GroupId IS NOT NULL) THROW 51002,'ACCESS_BUSINESS_VIEW_INVALID',1;
-    IF (@ViewMode='A' AND ISNULL(@DataScope,0)<3) OR ISNULL(@DataScope,0) NOT BETWEEN 1 AND 3 THROW 51003,'ACCESS_BUSINESS_SCOPE_DENIED',1;
+    DECLARE @DataScope tinyint=(SELECT DataScopeCode FROM @AccessPermissions WHERE PermissionCode=''PROCESS.LIST'');
+    IF @ViewMode IS NULL OR @ViewMode NOT IN (''G'',''A'') OR (@ViewMode=''G'' AND @GroupId IS NULL) OR (@ViewMode=''A'' AND @GroupId IS NOT NULL) THROW 51002,''ACCESS_BUSINESS_VIEW_INVALID'',1;
+    IF (@ViewMode=''A'' AND ISNULL(@DataScope,0)<3) OR ISNULL(@DataScope,0) NOT BETWEEN 1 AND 3 THROW 51003,''ACCESS_BUSINESS_SCOPE_DENIED'',1;
     CREATE TABLE #EligibleGroups(GroupId uniqueidentifier NOT NULL PRIMARY KEY,LegacySecurityGroupId varchar(200) NOT NULL);
     INSERT #EligibleGroups(GroupId,LegacySecurityGroupId)
       SELECT g.GroupId,g.LegacySecurityGroupId FROM dbo.di_group g
       JOIN dbo.di_info_securityGroup oldg ON oldg.id=g.LegacySecurityGroupRowId AND oldg.securityGroupId COLLATE Latin1_General_100_BIN2=g.LegacySecurityGroupId COLLATE Latin1_General_100_BIN2
-      WHERE g.GroupStatus=2 AND oldg.active=1 AND (@ViewMode='A' OR g.GroupId=@GroupId)
+      WHERE g.GroupStatus=2 AND oldg.active=1 AND (@ViewMode=''A'' OR g.GroupId=@GroupId)
         AND (g.ProviderTypeId=3 OR NOT EXISTS(SELECT 1 FROM dbo.di_userAccount WHERE UserId=@ActorUserId AND IsExternal=1));
     -- #endregion
+    IF @Take IS NULL OR @Take NOT BETWEEN 1 AND 100 THROW 51002,''ACCESS_PAGE_SIZE_INVALID'',1;
+    IF @IncludeInactive=1 AND NOT EXISTS(SELECT 1 FROM @AccessPermissions WHERE PermissionCode=''PROCESS.DISABLE'' AND DataScopeCode IN (2,3)) THROW 51003,''ACCESS_PERMISSION_DENIED'',1;
+    DECLARE @AfterId bigint=TRY_CONVERT(bigint,@AfterProcessId);
+    IF @AfterProcessId IS NOT NULL AND (@AfterId IS NULL OR @AfterId<1 OR @AfterProcessId LIKE ''%[^0-9]%'') THROW 51002,''ACCESS_CURSOR_INVALID'',1;
 
- -- A is an explicit application-wide read: only a live application role with All scope.
- -- G always retains the reviewed group/region/creator boundaries, including for administrators.
- IF @ViewMode='A' AND NOT EXISTS(SELECT 1 FROM dbo.di_userRoleMapping ur
-   JOIN dbo.di_role r ON r.RoleId=ur.RoleId AND r.IsActive=1
-   WHERE ur.UserId=@ActorUserId AND ur.GrantScope='A' AND ur.RoleId IN(4,5)
-   AND ur.IsActive=1 AND ur.BeginsAtUTC<=@Now AND (ur.EndsAtUTC IS NULL OR ur.EndsAtUTC>@Now))
-   THROW 51003,'ACCESS_APPLICATION_ALL_DENIED',1;
- IF @ViewMode='G' AND NOT EXISTS(SELECT 1 FROM dbo.di_groupMembership m
-   JOIN dbo.di_group g ON g.GroupId=m.GroupId AND g.GroupStatus=2
-   JOIN dbo.di_userAccount u ON u.UserId=m.UserId
-   LEFT JOIN dbo.di_userIdentity pi ON pi.IdentityId=m.ProofIdentityId
-   WHERE m.UserId=@ActorUserId AND m.GroupId=@GroupId AND m.LocalState=1 AND m.ApprovalStatus IN(0,2,4)
-   AND (u.IsExternal=0 OR g.ProviderTypeId=3)
-   AND (g.ProviderTypeId=3 OR (m.ProofStatus=1 AND m.ProofExpiresAtUTC>@Now
-   AND m.ProofObservedAtUTC>=DATEADD(minute,-15,@Now) AND pi.IdentityStatus=2 AND pi.UserId=m.UserId
-   AND pi.ProviderTypeId=g.ProviderTypeId AND ((g.ProviderTypeId=1 AND pi.ProviderNamespace=g.DirectoryKey)
-   OR (g.ProviderTypeId=2 AND pi.ProviderNamespace IN('https://accounts.google.com','accounts.google.com'))))))
-   THROW 51003,'ACCESS_APPLICATION_GROUP_DENIED',1;
- SELECT p.id INTO #Scope FROM dbo.di_flpConfiguration p WHERE
-   NOT EXISTS(SELECT 1 FROM dbo.di_flpConfiguration ambiguous WHERE ambiguous.flpConfigurationId=p.flpConfigurationId AND ambiguous.id<>p.id) AND
-   (@ViewMode='A' OR (NOT EXISTS(SELECT 1 FROM dbo.di_flpConfiguration ambiguous WHERE ambiguous.flpConfigurationId=p.flpConfigurationId AND ambiguous.id<>p.id) AND EXISTS(
+    SELECT TOP(@Take+1) p.id AS RowId,CONVERT(nvarchar(100),p.id) AS ProcessId,p.flpConfigurationId AS ConfigurationId,p.process_name AS ProcessName,p.Description,p.created_date AS CreatedAt,p.modified_date AS ModifiedAt,p.is_active AS IsActive,p.regionId AS RegionId,p.subRegionId AS SubRegionId,p.clientId AS ClientId,HASHBYTES(''SHA2_256'',CONVERT(varbinary(max),(SELECT p.process_name,p.Description,p.is_active,p.modified_date,p.regionId,p.subRegionId,p.clientId,p.sharePointApplicationId,p.sourcePath,p.destinationPath FOR JSON PATH,WITHOUT_ARRAY_WRAPPER,INCLUDE_NULL_VALUES))) AS StateVersion INTO #Page
+      FROM dbo.di_flpConfiguration p WHERE (@AfterId IS NULL OR p.id>@AfterId) AND (p.is_active=1 OR (@IncludeInactive=1 AND p.is_active=0)) AND NOT EXISTS(SELECT 1 FROM dbo.di_flpConfiguration ambiguous WHERE ambiguous.flpConfigurationId=p.flpConfigurationId AND ambiguous.id<>p.id) AND EXISTS(
         SELECT 1 FROM #EligibleGroups eg
         JOIN dbo.di_flpConfigurationSecurityGroupMapping oldm ON oldm.securityGroupId=eg.LegacySecurityGroupId AND oldm.flpConfigurationId=p.flpConfigurationId AND oldm.active=1
-        JOIN dbo.di_groupScopeMapping sm ON sm.GroupId=eg.GroupId AND sm.ScopeKind='REGION' AND sm.IsActive=1 AND sm.RegionId=p.regionId AND sm.ClientId=p.clientId AND CONVERT(varchar(55),sm.SubRegionId)=p.subRegionId
+        JOIN dbo.di_groupScopeMapping sm ON sm.GroupId=eg.GroupId AND sm.ScopeKind=''REGION'' AND sm.IsActive=1 AND sm.RegionId=p.regionId AND sm.ClientId=p.clientId AND CONVERT(varchar(55),sm.SubRegionId)=p.subRegionId
         JOIN dbo.di_info_region r ON r.Id=sm.RegionId AND r.active=1
         JOIN dbo.di_info_sub_region sr ON sr.Id=sm.SubRegionId AND sr.regionId=r.Id AND sr.active=1
-        JOIN dbo.di_info_clientnames c ON c.Id=sm.ClientId AND c.active=1))) AND (@DataScope<>1 OR EXISTS(SELECT 1 FROM dbo.di_userLegacyLink a JOIN dbo.di_userAccount owneru ON owneru.UserId=a.UserId JOIN dbo.di_AppUsers olduser ON olduser.Id=owneru.LegacyAppUserId AND olduser.LoginId COLLATE Latin1_General_100_BIN2=owneru.LegacyLoginId COLLATE Latin1_General_100_BIN2 WHERE a.UserId=@ActorUserId AND a.AliasAuthority='TPDI' AND a.AliasKind=2 AND a.IsActive=1 AND a.NormalizedAlias=UPPER(LTRIM(RTRIM(p.created_by))) COLLATE Latin1_General_100_BIN2));
- CREATE UNIQUE CLUSTERED INDEX IX_Scope ON #Scope(id);
- DECLARE @Json nvarchar(max),@Total int,@Month int=MONTH(@Now),@MonthName nvarchar(30)=DATENAME(month,@Now);
- IF @View='processes'
- BEGIN
-   SELECT p.id,p.flpConfigurationId AS configurationId,p.process_name AS processName,
-     p.sender_communication_email AS senderEmail,p.created_by AS createdBy,p.loginid AS loginId,
-     p.processTypeId,p.regionId,p.subRegionId,CONVERT(varchar(10),p.created_date,101) AS createdDate,
-     p.region AS regionName,p.subRegion AS subRegionName,p.clientName,
-     pt.processTypeName AS processTypeName,CONVERT(varchar(10),p.modified_date,101) AS updatedOn,p.updatedByName AS updatedBy,
-     p.multisheet AS multiSheet,p.dataSourceTypeId,p.Description AS description,
-     ctm.tabName,ctm.tableName,dbc.databaseName,p.fileProcessingServerTypeId AS ingestionTypeId,fpst.serverName AS ingestionType
-     INTO #Processes FROM dbo.di_flpConfiguration p JOIN #Scope sc ON sc.id=p.id
-     LEFT JOIN dbo.di_info_processType pt ON pt.processTypeId=p.processTypeId
-     LEFT JOIN dbo.di_info_FileProcessingServerType fpst ON fpst.flpServerTypeId=p.fileProcessingServerTypeId
-     OUTER APPLY(SELECT m.tabName,m.tableName,m.databaseConfigurationId FROM dbo.di_configurationTableMapping m
-       WHERE m.flpConfigurationId=p.flpConfigurationId AND m.active=1 AND ISNULL(m.ignoreSheet,0)=0) ctm
-     LEFT JOIN dbo.di_databaseConfiguration dbc ON dbc.id=ctm.databaseConfigurationId
-     WHERE p.is_active=@Active AND (@Search IS NULL OR EXISTS(SELECT 1 FROM (VALUES
-         ('process',CONVERT(nvarchar(max),p.process_name)),('type',pt.processTypeName),('region',p.region),('subregion',p.subRegion),('client',p.clientName),
-         ('database',dbc.databaseName),('table',ctm.tableName),('creator',p.userName),('ingestion',fpst.serverName),('description',p.Description)
-       ) searchColumns(field,value) WHERE (@SearchFields IS NULL OR searchColumns.field IN(SELECT value FROM STRING_SPLIT(@SearchFields,','))) AND CHARINDEX(@Search,searchColumns.value)>0))
-       AND (@From IS NULL OR p.created_date>=@From) AND (@To IS NULL OR p.created_date<@To);
-   SELECT @Total=COUNT(*) FROM #Processes;
-   SET @Json=(SELECT JSON_QUERY((SELECT *,ROW_NUMBER() OVER(ORDER BY id DESC,tabName) AS rowNo FROM #Processes ORDER BY id DESC,tabName
-     OFFSET (@Page-1)*@Take ROWS FETCH NEXT @Take ROWS ONLY FOR JSON PATH)) AS response,@Total AS totalCount FOR JSON PATH,WITHOUT_ARRAY_WRAPPER);
- END
- ELSE IF @View='processcounts'
-   SET @Json=(SELECT COUNT(*) AS processRowCount,COUNT(CASE WHEN p.created_date>=DATEFROMPARTS(YEAR(@Now),@Month,1) THEN 1 END) AS newProcessCount,
-     @Month AS currentMonth,@MonthName AS currentMonthName FROM dbo.di_flpConfiguration p JOIN #Scope s ON s.id=p.id WHERE p.is_active=1 FOR JSON PATH,WITHOUT_ARRAY_WRAPPER);
- ELSE IF @View='clientcounts'
-   SET @Json=(SELECT COUNT(DISTINCT p.clientId) AS totalClients,COUNT(DISTINCT CASE WHEN c.active=1 THEN p.clientId END) AS activeClients,
-     @Month AS currentMonth,@MonthName AS currentMonthName FROM dbo.di_flpConfiguration p JOIN #Scope s ON s.id=p.id
-     JOIN dbo.di_info_clientnames c ON c.id=p.clientId WHERE p.is_active=1 FOR JSON PATH,WITHOUT_ARRAY_WRAPPER);
- ELSE IF @View NOT IN('extensions','dateformats')
- BEGIN
-   SELECT uf.id,uf.uploadFileId,uf.flpConfigurationId AS configurationId,p.process_name AS processName,
-     uf.fileName,uf.creationDateTime,uf.updationDateTime,uf.flpProcessStatusId AS processStatusId,
-     (SELECT MAX(statusName) FROM dbo.di_info_flpProcessStatus WHERE statusCode=uf.flpProcessStatusId AND active=1) AS processStatusName,
-     p.clientId,p.clientName,p.regionId,p.region AS regionName,p.subRegion AS subRegionName,p.loginid AS loginId,p.processTypeId,p.fileProcessingServerTypeId,
-     uf.UploadedBy AS createdBy,p.Description,ctm.tableName,ctm.tabName,dbc.databaseName
-     INTO #Files FROM dbo.di_uploadedFile uf JOIN dbo.di_flpConfiguration p ON p.flpConfigurationId=uf.flpConfigurationId
-     JOIN #Scope s ON s.id=p.id
-     OUTER APPLY(SELECT TOP(1) m.tableName,m.tabName,m.databaseConfigurationId FROM dbo.di_configurationTableMapping m
-       WHERE m.flpConfigurationId=p.flpConfigurationId AND m.active=1 AND ISNULL(m.ignoreSheet,0)=0 ORDER BY m.id) ctm
-     LEFT JOIN dbo.di_databaseConfiguration dbc ON dbc.id=ctm.databaseConfigurationId
-     WHERE uf.active=1 AND p.is_active=1 AND (@From IS NULL OR uf.creationDateTime>=@From) AND (@To IS NULL OR uf.creationDateTime<@To)
-       AND (@ConfigurationId IS NULL OR uf.flpConfigurationId=@ConfigurationId)
-       AND (@UploadId IS NULL OR CONVERT(varchar(200),uf.uploadFileId)=@UploadId)
-       AND (@Search IS NULL OR CHARINDEX(@Search,uf.fileName)>0 OR CHARINDEX(@Search,p.process_name)>0)
-       AND (@DataScope<>1 OR EXISTS(SELECT 1 FROM dbo.di_userLegacyLink a JOIN dbo.di_userAccount owneru ON owneru.UserId=a.UserId JOIN dbo.di_AppUsers olduser ON olduser.Id=owneru.LegacyAppUserId AND olduser.LoginId COLLATE Latin1_General_100_BIN2=owneru.LegacyLoginId COLLATE Latin1_General_100_BIN2 WHERE a.UserId=@ActorUserId AND a.AliasAuthority='TPDI' AND a.AliasKind=3 AND a.IsActive=1 AND a.NormalizedAlias=UPPER(LTRIM(RTRIM(uf.UploadedBy))) COLLATE Latin1_General_100_BIN2));
-   IF @View='filecounts'
-     SET @Json=(SELECT COUNT(*) AS totalUploadedFiles,COUNT(CASE WHEN processStatusId=2 THEN 1 END) AS successCount,
-       COUNT(CASE WHEN processStatusId IN(3,4) THEN 1 END) AS failureCount,
-       COUNT(CASE WHEN creationDateTime>=DATEFROMPARTS(YEAR(@Now),@Month,1) THEN 1 END) AS newFileProcessCount,
-       @Month AS currentMonth,@MonthName AS currentMonthName FROM #Files FOR JSON PATH,WITHOUT_ARRAY_WRAPPER);
-   ELSE IF @View='recent'
-     SET @Json=(SELECT TOP(@Take) configurationId,processName,uploadFileId,fileName,creationDateTime,processStatusId,processStatusName FROM #Files ORDER BY id DESC FOR JSON PATH);
-   ELSE IF @View='uploads'
-     SET @Json=(SELECT f.processTypeId,MAX(pt.processTypeName) AS processType,COUNT(*) AS totalUploadedFiles FROM #Files f
-       LEFT JOIN dbo.di_info_processType pt ON pt.processTypeId=f.processTypeId GROUP BY f.processTypeId FOR JSON PATH);
-   ELSE IF @View='utilization'
-     SET @Json=(SELECT COUNT(*) AS totalFileCount,MONTH(creationDateTime) AS month,DATENAME(month,creationDateTime) AS monthName,clientId,MAX(clientName) AS clientName
-       FROM #Files GROUP BY YEAR(creationDateTime),MONTH(creationDateTime),DATENAME(month,creationDateTime),clientId FOR JSON PATH);
-   ELSE IF @View='regions'
-     SET @Json=(SELECT regionId,MAX(regionName) AS regionName,COUNT(*) AS totalFileCount FROM #Files GROUP BY regionId FOR JSON PATH);
-   ELSE IF @View='history'
-   BEGIN
-     SELECT @Total=COUNT(*) FROM #Files;
-     SET @Json=(SELECT JSON_QUERY((SELECT *,processStatusName AS statusName,uploadFileId AS fileId,creationDateTime AS createdDate,creationDateTime AS startTime,updationDateTime AS endTime
-       FROM #Files ORDER BY id DESC OFFSET (@Page-1)*@Take ROWS FETCH NEXT @Take ROWS ONLY FOR JSON PATH)) AS response,
-       @Total AS totalCount FOR JSON PATH,WITHOUT_ARRAY_WRAPPER);
-   END
-   ELSE IF @View='status'
-     SET @Json=(SELECT c.clientId,MAX(c.clientName) AS clientName,JSON_QUERY((SELECT p.configurationId AS flpConfigurationID,MAX(p.processName) AS flpConfigurationName,
-       JSON_QUERY((SELECT TOP(@Take) f.uploadFileId,f.fileName AS uploadFileName,f.creationDateTime AS fileCreationDate,f.processStatusId AS fileProcessStatusId,
-         f.processStatusName AS fileProcessstatusName,f.databaseName,f.tableName,f.tabName,f.fileProcessingServerTypeId FROM #Files f
-         WHERE f.configurationId=p.configurationId ORDER BY f.id DESC FOR JSON PATH)) AS uploadedFiles
-       FROM #Files p WHERE p.clientId=c.clientId GROUP BY p.configurationId FOR JSON PATH)) AS fileConfigurationStatusList
-       FROM #Files c GROUP BY c.clientId FOR JSON PATH);
-   ELSE IF @View='filedetail'
-     SET @Json=(SELECT TOP(1) configurationId AS flpConfigurationID,uploadFileId AS uploadFileID,fileName AS uploadFile,databaseName,tableName,Description,tabName,
-       JSON_QUERY((SELECT ls.statusName,ls.statusName AS logStatusName,st.flpFileLogStatusId,
-         st.activityProcessStatusId AS processStatusId,aps.statusName AS processStatusName,
-         st.creationDateTime AS statusStartTime,st.updationDateTime AS statusCompletionTime,
-         DATEDIFF_BIG(millisecond,st.creationDateTime,st.updationDateTime)/1000.0 AS durationInSeconds,st.tabName
-         FROM dbo.di_flpFileUploadStatus st
-         JOIN dbo.di_info_flpActivityLogStatus ls ON ls.flpFileLogStatusId=st.flpFileLogStatusId AND ls.active=1
-         JOIN dbo.di_info_flpActivityProcessStatus aps ON aps.activityProcessStatusId=st.activityProcessStatusId
-         WHERE st.flpConfigurationId=#Files.configurationId AND st.uploadFileId=#Files.uploadFileId AND st.active=1
-         ORDER BY ls.sequenceNo,st.id FOR JSON PATH)) AS fileStatus
-       FROM #Files ORDER BY id DESC FOR JSON PATH,WITHOUT_ARRAY_WRAPPER);
- END
- -- These reviewed display catalogues contain no credentials or connection strings.
- ELSE IF @View='extensions' SET @Json=(SELECT id,fileExtension FROM dbo.di_info_FileExtensionName WHERE isActive=1 FOR JSON PATH);
- ELSE IF @View='dateformats' SET @Json=(SELECT id,formatId,format,apiFormat,formatDataTypeId,DisplayOnLandingLayer FROM dbo.di_info_datetimeFormat WHERE active=1 FOR JSON PATH);
- SELECT COALESCE(@Json,CASE WHEN @View IN('filedetail','processcounts','filecounts','clientcounts') THEN '{}' ELSE '[]' END) AS Payload;
+        JOIN dbo.di_info_clientnames c ON c.Id=sm.ClientId AND c.active=1) AND (@DataScope<>1 OR EXISTS(SELECT 1 FROM dbo.di_userLegacyLink a JOIN dbo.di_userAccount owneru ON owneru.UserId=a.UserId JOIN dbo.di_AppUsers olduser ON olduser.Id=owneru.LegacyAppUserId AND olduser.LoginId COLLATE Latin1_General_100_BIN2=owneru.LegacyLoginId COLLATE Latin1_General_100_BIN2 WHERE a.UserId=@ActorUserId AND a.AliasAuthority=''TPDI'' AND a.AliasKind=2 AND a.IsActive=1 AND a.NormalizedAlias=UPPER(LTRIM(RTRIM(p.created_by))) COLLATE Latin1_General_100_BIN2)) ORDER BY p.id;
+    SELECT TOP(@Take) ProcessId,ConfigurationId,ProcessName,Description,CreatedAt,ModifiedAt,IsActive,RegionId,SubRegionId,ClientId,StateVersion FROM #Page ORDER BY RowId;
+
+    SELECT @Take AS Take,CONVERT(bit,CASE WHEN COUNT(*)>@Take THEN 1 ELSE 0 END) AS HasMore,
+      CASE WHEN COUNT(*)>@Take THEN CONVERT(nvarchar(100),(SELECT MAX(RowId) FROM (SELECT TOP(@Take) RowId FROM #Page ORDER BY RowId) pageEnd)) ELSE NULL END AS NextCursor FROM #Page;
+
+    COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+      IF XACT_STATE()<>0 ROLLBACK TRANSACTION;
+      THROW;
+    END CATCH;
+END;
+';
+
  COMMIT TRANSACTION;
- END TRY BEGIN CATCH
-   IF XACT_STATE()<>0 ROLLBACK TRANSACTION;
-   THROW;
- END CATCH
-END;
-GO
-
-SET ANSI_NULLS ON;
-SET QUOTED_IDENTIFIER ON;
-GO
-
-CREATE PROCEDURE dbo.sel_accessHierarchy
- @ActorUserId uniqueidentifier,@ActorSessionId uniqueidentifier,@SessionHash binary(32),
- @GroupId uniqueidentifier,@Kind varchar(12),@RegionId int=NULL,@SubRegionId int=NULL,@AfterId int=NULL,@Take int=100
-AS
-BEGIN
- SET NOCOUNT ON;
- SET XACT_ABORT ON;
- DECLARE @Now datetime2(3)=SYSUTCDATETIME();
- IF NOT EXISTS(SELECT 1 FROM dbo.di_userSession se JOIN dbo.di_userAccount u ON u.UserId=se.UserId JOIN dbo.di_userIdentity i ON i.IdentityId=se.IdentityId AND i.UserId=u.UserId
-  WHERE se.SessionId=@ActorSessionId AND se.UserId=@ActorUserId AND se.SessionHash=@SessionHash AND se.RevokedAtUTC IS NULL
-   AND se.AbsoluteExpiresAtUTC>@Now AND se.IdleExpiresAtUTC>@Now AND se.UserSecurityVersion=u.SecurityVersion AND u.AccountStatus=2 AND i.IdentityStatus=2)
-  THROW 51001,'ACCESS_SESSION_INVALID',1;
- IF @GroupId IS NULL OR @Kind NOT IN('REGION','SUBREGION','CLIENT') OR @Take NOT BETWEEN 1 AND 100 OR ISNULL(@AfterId,1)<1
-  OR (@Kind='REGION' AND (@RegionId IS NOT NULL OR @SubRegionId IS NOT NULL))
-  OR (@Kind IN('SUBREGION','CLIENT') AND ISNULL(@RegionId,0)<1) OR (@Kind='SUBREGION' AND @SubRegionId IS NOT NULL)
-  OR (@SubRegionId IS NOT NULL AND @SubRegionId<1) THROW 51002,'ACCESS_HIERARCHY_QUERY_INVALID',1;
- -- Lookup choices are approved membership scope, never the administrator's global catalogue.
- IF NOT EXISTS(SELECT 1 FROM dbo.di_groupMembership m JOIN dbo.di_group g ON g.GroupId=m.GroupId
-  JOIN dbo.di_userAccount u ON u.UserId=m.UserId LEFT JOIN dbo.di_userIdentity pi ON pi.IdentityId=m.ProofIdentityId
-  WHERE m.UserId=@ActorUserId AND m.GroupId=@GroupId AND m.LocalState=1 AND m.ApprovalStatus IN(0,2,4) AND g.GroupStatus=2
-   AND (u.IsExternal=0 OR g.ProviderTypeId=3)
-   AND (g.ProviderTypeId=3 OR (m.ProofStatus=1 AND m.ProofExpiresAtUTC>@Now AND m.ProofObservedAtUTC>=DATEADD(minute,-15,@Now)
-    AND pi.IdentityStatus=2 AND pi.UserId=m.UserId AND pi.ProviderTypeId=g.ProviderTypeId
-    AND ((g.ProviderTypeId=1 AND pi.ProviderNamespace=g.DirectoryKey) OR (g.ProviderTypeId=2 AND pi.ProviderNamespace IN('https://accounts.google.com','accounts.google.com'))))))
-  THROW 51003,'ACCESS_MEMBERSHIP_REQUIRED',1;
- ;WITH Allowed AS (
-  SELECT m.RegionId,r.Name RegionName,m.SubRegionId,s.Name SubRegionName,m.ClientId,c.Name ClientName
-  FROM dbo.di_groupScopeMapping m JOIN dbo.di_info_region r ON r.Id=m.RegionId AND r.active=1
-  JOIN dbo.di_info_sub_region s ON s.Id=m.SubRegionId AND s.regionId=m.RegionId AND s.active=1
-  JOIN dbo.di_info_clientnames c ON c.Id=m.ClientId AND c.active=1
-  WHERE m.GroupId=@GroupId AND m.ScopeKind='REGION' AND m.IsActive=1
- ), Choices AS (
-  SELECT RegionId Id,RegionName Label,CONVERT(int,NULL) ParentId FROM Allowed WHERE @Kind='REGION'
-  UNION ALL SELECT SubRegionId,SubRegionName,RegionId FROM Allowed WHERE @Kind='SUBREGION' AND RegionId=@RegionId
-  UNION ALL SELECT ClientId,ClientName,SubRegionId FROM Allowed WHERE @Kind='CLIENT' AND RegionId=@RegionId AND (@SubRegionId IS NULL OR SubRegionId=@SubRegionId)
- )
- SELECT TOP(@Take) CONVERT(nvarchar(64),Id) AS Value,Label,CONVERT(nvarchar(64),MIN(ParentId)) AS ParentValue
- FROM Choices WHERE @AfterId IS NULL OR Id>@AfterId GROUP BY Id,Label ORDER BY Id;
-END;
-GO
-
-SET ANSI_NULLS ON;
-SET QUOTED_IDENTIFIER ON;
-GO
-
-CREATE PROCEDURE dbo.sel_accessSources
-    @ActorUserId uniqueidentifier,
-    @ActorSessionId uniqueidentifier,
-    @SessionHash binary(32),
-    @GroupId uniqueidentifier,
-    @Mode char(1)='R',
-    @AfterId bigint=NULL,
-    @Take int=50
-AS
-BEGIN
-    SET NOCOUNT ON;
-    SET XACT_ABORT ON;
-    DECLARE @Now datetime2(3)=SYSUTCDATETIME();
-    IF NOT EXISTS (SELECT 1 FROM dbo.di_userSession s WITH(HOLDLOCK) JOIN dbo.di_userAccount u WITH(HOLDLOCK) ON u.UserId=s.UserId JOIN dbo.di_userIdentity i WITH(HOLDLOCK) ON i.IdentityId=s.IdentityId AND i.UserId=s.UserId WHERE s.SessionId=@ActorSessionId AND s.SessionHash=@SessionHash AND s.UserId=@ActorUserId AND s.RevokedAtUTC IS NULL AND s.AbsoluteExpiresAtUTC>@Now AND s.IdleExpiresAtUTC>@Now AND s.UserSecurityVersion=u.SecurityVersion AND u.AccountStatus=2 AND i.IdentityStatus=2) THROW 51001,'ACCESS_SESSION_INVALID',1;
-    DECLARE @ScopeGroupId uniqueidentifier=@GroupId;
-    DECLARE @AccessPermissions TABLE(PermissionCode varchar(100) PRIMARY KEY,DataScopeCode tinyint NOT NULL);
-    ;WITH EligibleRoles AS (
-      SELECT ur.RoleId,r.Priority FROM dbo.di_userRoleMapping ur WITH(HOLDLOCK) JOIN dbo.di_role r WITH(HOLDLOCK) ON r.RoleId=ur.RoleId AND r.IsActive=1
-      WHERE ur.UserId=@ActorUserId AND ur.IsActive=1 AND ur.BeginsAtUTC<=@Now AND (ur.EndsAtUTC IS NULL OR ur.EndsAtUTC>@Now)
-      AND ((ur.GrantScope='A' AND ur.RoleId IN (4,5)) OR (ur.GrantScope='G' AND ur.GroupId=@ScopeGroupId AND EXISTS (
-        SELECT 1 FROM dbo.di_groupMembership m WITH(HOLDLOCK) JOIN dbo.di_group g WITH(HOLDLOCK) ON g.GroupId=m.GroupId JOIN dbo.di_userAccount u WITH(HOLDLOCK) ON u.UserId=m.UserId LEFT JOIN dbo.di_userIdentity pi WITH(HOLDLOCK) ON pi.IdentityId=m.ProofIdentityId
-        JOIN dbo.di_groupRoleMapping gr WITH(HOLDLOCK) ON gr.GroupId=m.GroupId AND gr.RoleId=ur.RoleId AND gr.IsActive=1
-        WHERE m.MembershipId=ur.MembershipId AND m.UserId=ur.UserId AND ur.GrantMembershipEpoch=m.MembershipEpoch AND m.LocalState=1 AND m.ApprovalStatus IN (0,2,4) AND g.GroupStatus=2 AND (u.IsExternal=0 OR g.ProviderTypeId=3) AND (g.ProviderTypeId=3 OR (m.ProofStatus=1 AND m.ProofExpiresAtUTC>@Now AND m.ProofObservedAtUTC>=DATEADD(minute,-15,@Now) AND pi.IdentityStatus=2 AND pi.UserId=m.UserId AND pi.ProviderTypeId=g.ProviderTypeId AND ((g.ProviderTypeId=1 AND pi.ProviderNamespace=g.DirectoryKey) OR (g.ProviderTypeId=2 AND pi.ProviderNamespace IN ('https://accounts.google.com','accounts.google.com'))))))))
-      AND (@ScopeGroupId IS NULL OR EXISTS (SELECT 1 FROM dbo.di_group g JOIN dbo.di_userAccount u ON u.UserId=@ActorUserId WHERE g.GroupId=@ScopeGroupId AND g.GroupStatus<>4 AND (u.IsExternal=0 OR g.ProviderTypeId=3)))
-    ), Chosen AS (SELECT RoleId FROM EligibleRoles WHERE Priority=(SELECT MAX(Priority) FROM EligibleRoles))
-    INSERT @AccessPermissions SELECT p.PermissionCode,MAX(rp.DataScopeCode) FROM Chosen c JOIN dbo.di_rolePermission rp WITH(HOLDLOCK) ON rp.RoleId=c.RoleId AND rp.IsActive=1 JOIN dbo.di_info_permission p WITH(HOLDLOCK) ON p.PermissionId=rp.PermissionId AND p.IsActive=1 GROUP BY p.PermissionCode;
-
-
-    IF @Take NOT BETWEEN 1 AND 100 OR @Mode NOT IN ('C','R','S') OR @GroupId IS NULL THROW 51002,'ACCESS_SOURCE_QUERY_INVALID',1;
-    DECLARE @CanManage bit=CASE WHEN EXISTS(SELECT 1 FROM @AccessPermissions WHERE PermissionCode='SOURCE.MANAGE' AND DataScopeCode=4) THEN 1 ELSE 0 END;
-    IF @Mode='S'
-    BEGIN
-      IF @CanManage=0 AND NOT EXISTS(SELECT 1 FROM @AccessPermissions WHERE PermissionCode IN ('PROCESS.CREATE','PROCESS.EXECUTE','FILE.UPLOAD') AND DataScopeCode IN (2,3)) THROW 51003,'ACCESS_PERMISSION_DENIED',1;
-      SELECT TOP(@Take) m.MappingId,m.RegionId,m.SubRegionId,m.ClientId,r.Name AS RegionName,s.Name AS SubRegionName,c.Name AS ClientName
-      FROM dbo.di_groupScopeMapping m JOIN dbo.di_info_region r ON r.Id=m.RegionId AND r.active=1 JOIN dbo.di_info_sub_region s ON s.Id=m.SubRegionId AND s.regionId=r.Id AND s.active=1 JOIN dbo.di_info_clientnames c ON c.Id=m.ClientId AND c.active=1
-      WHERE m.GroupId=@GroupId AND m.ScopeKind='REGION' AND m.IsActive=1 AND (@AfterId IS NULL OR m.MappingId>@AfterId) ORDER BY m.MappingId;
-      RETURN;
-    END;
-    IF @Mode='C'
-    BEGIN
-      IF @CanManage=0 AND NOT EXISTS(SELECT 1 FROM @AccessPermissions WHERE PermissionCode IN ('PROCESS.CREATE','PROCESS.EXECUTE','FILE.UPLOAD') AND DataScopeCode IN (2,3)) THROW 51003,'ACCESS_PERMISSION_DENIED',1;
-      SELECT TOP(@Take) m.MappingId,m.ScopeKind AS SourceKind,
-        CASE WHEN m.ScopeKind='SHAREPOINT' THEN CONVERT(nvarchar(64),sp.applicationid) ELSE CONVERT(nvarchar(64),gd.tenantid) END AS ResourceId,
-        CASE WHEN m.ScopeKind='SHAREPOINT' THEN sp.displayname ELSE gd.displayname END AS DisplayName,m.CanUse,m.CanManage
-      FROM dbo.di_groupScopeMapping m
-      LEFT JOIN dbo.di_application sp ON m.ScopeKind='SHAREPOINT' AND sp.applicationid=m.SharePointApplicationId AND sp.isactive=1 AND sp.deletedon IS NULL AND ISNULL(sp.isdraft,0)=0
-      LEFT JOIN dbo.di_gdrive_tenant gd ON m.ScopeKind='GDRIVE' AND gd.tenantid=m.GoogleDriveTenantId AND gd.isactive=1 AND ISNULL(gd.isdraft,0)=0
-      WHERE m.GroupId=@GroupId AND m.IsActive=1 AND m.ScopeKind IN ('SHAREPOINT','GDRIVE') AND (m.CanUse=1 OR (@CanManage=1 AND m.CanManage=1))
-        AND (sp.applicationid IS NOT NULL OR gd.tenantid IS NOT NULL) AND (@AfterId IS NULL OR m.MappingId>@AfterId) ORDER BY m.MappingId;
-      RETURN;
-    END;
-    SELECT TOP(@Take) r.RequestId,r.GroupId,r.RequestedByUserId,u.DisplayName AS RequestedByName,r.SourceKind,r.DisplayName,r.LocationUrl,r.Details,r.RegionId,r.SubRegionId,r.ClientId,
-      r.RequestStatus,r.ResourceId,r.ResolutionNote,r.CreatedAtUTC,r.UpdatedAtUTC,r.RowVersion
-    FROM dbo.di_sourceSetupRequest r JOIN dbo.di_userAccount u ON u.UserId=r.RequestedByUserId
-    WHERE r.GroupId=@GroupId AND (@CanManage=1 OR r.RequestedByUserId=@ActorUserId) AND (@AfterId IS NULL OR r.RequestId>@AfterId) ORDER BY r.RequestId;
-
-END;
-GO
-
-SET ANSI_NULLS ON;
-SET QUOTED_IDENTIFIER ON;
-GO
-
-CREATE PROCEDURE dbo.commit_accessSourceRequest
-    @ActorUserId uniqueidentifier,
-    @ActorSessionId uniqueidentifier,
-    @SessionHash binary(32),
-    @OperationId uniqueidentifier,
-    @RequestHash binary(32),
-    @CorrelationId uniqueidentifier,
-    @ExpectedRowVersion binary(8)=NULL,
-    @Command varchar(12),
-    @GroupId uniqueidentifier,
-    @RequestId bigint=NULL,
-    @SourceKind varchar(16)=NULL,
-    @DisplayName nvarchar(120)=NULL,
-    @LocationUrl nvarchar(512)=NULL,
-    @Details nvarchar(1000)=NULL,
-    @RegionId int=NULL,
-    @SubRegionId int=NULL,
-    @ClientId int=NULL,
-    @ResourceId nvarchar(64)=NULL,
-    @ResolutionNote nvarchar(1000)=NULL
-AS
-BEGIN
-    SET NOCOUNT ON;
-    SET XACT_ABORT ON;
-    DECLARE @Now datetime2(3)=SYSUTCDATETIME();
-    IF @OperationId IS NULL OR @RequestHash IS NULL OR @CorrelationId IS NULL THROW 51002,'ACCESS_COMMAND_METADATA_REQUIRED',1;
-    BEGIN TRY
-      BEGIN TRANSACTION;
-    IF NOT EXISTS (SELECT 1 FROM dbo.di_userSession s WITH(HOLDLOCK) JOIN dbo.di_userAccount u WITH(HOLDLOCK) ON u.UserId=s.UserId JOIN dbo.di_userIdentity i WITH(HOLDLOCK) ON i.IdentityId=s.IdentityId AND i.UserId=s.UserId WHERE s.SessionId=@ActorSessionId AND s.SessionHash=@SessionHash AND s.UserId=@ActorUserId AND s.RevokedAtUTC IS NULL AND s.AbsoluteExpiresAtUTC>@Now AND s.IdleExpiresAtUTC>@Now AND s.UserSecurityVersion=u.SecurityVersion AND u.AccountStatus=2 AND i.IdentityStatus=2) THROW 51001,'ACCESS_SESSION_INVALID',1;
-    DECLARE @ScopeGroupId uniqueidentifier=@GroupId;
-    DECLARE @AccessPermissions TABLE(PermissionCode varchar(100) PRIMARY KEY,DataScopeCode tinyint NOT NULL);
-    ;WITH EligibleRoles AS (
-      SELECT ur.RoleId,r.Priority FROM dbo.di_userRoleMapping ur WITH(HOLDLOCK) JOIN dbo.di_role r WITH(HOLDLOCK) ON r.RoleId=ur.RoleId AND r.IsActive=1
-      WHERE ur.UserId=@ActorUserId AND ur.IsActive=1 AND ur.BeginsAtUTC<=@Now AND (ur.EndsAtUTC IS NULL OR ur.EndsAtUTC>@Now)
-      AND ((ur.GrantScope='A' AND ur.RoleId IN (4,5)) OR (ur.GrantScope='G' AND ur.GroupId=@ScopeGroupId AND EXISTS (
-        SELECT 1 FROM dbo.di_groupMembership m WITH(HOLDLOCK) JOIN dbo.di_group g WITH(HOLDLOCK) ON g.GroupId=m.GroupId JOIN dbo.di_userAccount u WITH(HOLDLOCK) ON u.UserId=m.UserId LEFT JOIN dbo.di_userIdentity pi WITH(HOLDLOCK) ON pi.IdentityId=m.ProofIdentityId
-        JOIN dbo.di_groupRoleMapping gr WITH(HOLDLOCK) ON gr.GroupId=m.GroupId AND gr.RoleId=ur.RoleId AND gr.IsActive=1
-        WHERE m.MembershipId=ur.MembershipId AND m.UserId=ur.UserId AND ur.GrantMembershipEpoch=m.MembershipEpoch AND m.LocalState=1 AND m.ApprovalStatus IN (0,2,4) AND g.GroupStatus=2 AND (u.IsExternal=0 OR g.ProviderTypeId=3) AND (g.ProviderTypeId=3 OR (m.ProofStatus=1 AND m.ProofExpiresAtUTC>@Now AND m.ProofObservedAtUTC>=DATEADD(minute,-15,@Now) AND pi.IdentityStatus=2 AND pi.UserId=m.UserId AND pi.ProviderTypeId=g.ProviderTypeId AND ((g.ProviderTypeId=1 AND pi.ProviderNamespace=g.DirectoryKey) OR (g.ProviderTypeId=2 AND pi.ProviderNamespace IN ('https://accounts.google.com','accounts.google.com'))))))))
-      AND (@ScopeGroupId IS NULL OR EXISTS (SELECT 1 FROM dbo.di_group g JOIN dbo.di_userAccount u ON u.UserId=@ActorUserId WHERE g.GroupId=@ScopeGroupId AND g.GroupStatus<>4 AND (u.IsExternal=0 OR g.ProviderTypeId=3)))
-    ), Chosen AS (SELECT RoleId FROM EligibleRoles WHERE Priority=(SELECT MAX(Priority) FROM EligibleRoles))
-    INSERT @AccessPermissions SELECT p.PermissionCode,MAX(rp.DataScopeCode) FROM Chosen c JOIN dbo.di_rolePermission rp WITH(HOLDLOCK) ON rp.RoleId=c.RoleId AND rp.IsActive=1 JOIN dbo.di_info_permission p WITH(HOLDLOCK) ON p.PermissionId=rp.PermissionId AND p.IsActive=1 GROUP BY p.PermissionCode;
-
-      DECLARE @LockResult int;
-      DECLARE @LockName nvarchar(255)=N'DIAccessCommand:'+CONVERT(nvarchar(36),@OperationId);
-      EXEC @LockResult=sys.sp_getapplock @Resource=@LockName,@LockMode='Exclusive',@LockOwner='Transaction',@LockTimeout=5000;
-      IF @LockResult<0 THROW 51009,'ACCESS_COMMAND_BUSY',1;
-      IF EXISTS (SELECT 1 FROM dbo.di_accessAudit WHERE OperationId=@OperationId AND EventSequence=0)
-      BEGIN
-        IF NOT EXISTS (SELECT 1 FROM dbo.di_accessAudit WHERE OperationId=@OperationId AND EventSequence=0 AND RequestHash=@RequestHash AND EventCode='commit_accessSourceRequest' AND ActorUserId=@ActorUserId) THROW 51004,'ACCESS_IDEMPOTENCY_CONFLICT',1;
-        SELECT 'AlreadyApplied' Disposition,TargetKey FROM dbo.di_accessAudit WHERE OperationId=@OperationId AND EventSequence=0;
-        COMMIT TRANSACTION; RETURN;
-      END;
-
-      IF @Command NOT IN ('REQUEST','START','COMPLETE','REJECT','CANCEL') OR @GroupId IS NULL THROW 51002,'ACCESS_SOURCE_COMMAND_INVALID',1;
-      IF NOT EXISTS(SELECT 1 FROM dbo.di_group WHERE GroupId=@GroupId AND GroupStatus=2) THROW 51003,'ACCESS_GROUP_REQUIRED',1;
-      DECLARE @CanManage bit=CASE WHEN EXISTS(SELECT 1 FROM @AccessPermissions WHERE PermissionCode='SOURCE.MANAGE' AND DataScopeCode=4) THEN 1 ELSE 0 END;
-      IF @Command='REQUEST'
-      BEGIN
-        IF @RequestId IS NOT NULL OR @SourceKind NOT IN ('SHAREPOINT','GDRIVE') OR @SourceKind IS NULL OR NULLIF(LTRIM(RTRIM(@DisplayName)),N'') IS NULL
-          OR @LocationUrl NOT LIKE N'https://%' OR @LocationUrl IS NULL OR @LocationUrl LIKE N'%[?#@]%' OR @LocationUrl LIKE N'%'+NCHAR(10)+N'%' OR @LocationUrl LIKE N'%'+NCHAR(13)+N'%'
-          THROW 51002,'ACCESS_SOURCE_REQUEST_INVALID',1;
-        IF @CanManage=0 AND NOT EXISTS(SELECT 1 FROM @AccessPermissions WHERE PermissionCode IN ('PROCESS.CREATE','PROCESS.EXECUTE','FILE.UPLOAD') AND DataScopeCode IN (2,3)) THROW 51003,'ACCESS_PERMISSION_DENIED',1;
-        IF NOT EXISTS(SELECT 1 FROM dbo.di_groupScopeMapping m JOIN dbo.di_info_region r ON r.Id=m.RegionId AND r.active=1 JOIN dbo.di_info_sub_region s ON s.Id=m.SubRegionId AND s.regionId=r.Id AND s.active=1 JOIN dbo.di_info_clientnames c ON c.Id=m.ClientId AND c.active=1
-          WHERE m.GroupId=@GroupId AND m.ScopeKind='REGION' AND m.IsActive=1 AND m.RegionId=@RegionId AND m.SubRegionId=@SubRegionId AND m.ClientId=@ClientId) THROW 51003,'ACCESS_SOURCE_REGION_NOT_MAPPED',1;
-        DECLARE @SourceLock nvarchar(255)=N'DIAccessSource:'+CONVERT(nvarchar(36),@GroupId);
-        EXEC @LockResult=sys.sp_getapplock @Resource=@SourceLock,@LockMode='Exclusive',@LockOwner='Transaction',@LockTimeout=5000;
-        IF @LockResult<0 THROW 51009,'ACCESS_COMMAND_BUSY',1;
-        IF EXISTS(SELECT 1 FROM dbo.di_sourceSetupRequest WHERE GroupId=@GroupId AND SourceKind=@SourceKind AND LocationUrl=@LocationUrl AND RegionId=@RegionId AND SubRegionId=@SubRegionId AND ClientId=@ClientId AND RequestStatus IN (1,2)) THROW 51006,'ACCESS_SOURCE_REQUEST_ALREADY_PENDING',1;
-        IF (SELECT COUNT(*) FROM dbo.di_sourceSetupRequest WHERE GroupId=@GroupId AND RequestedByUserId=@ActorUserId AND RequestStatus IN (1,2))>=20 THROW 51007,'ACCESS_SOURCE_REQUEST_LIMIT',1;
-        INSERT dbo.di_sourceSetupRequest(GroupId,RequestedByUserId,SourceKind,DisplayName,LocationUrl,Details,RegionId,SubRegionId,ClientId)
-        VALUES(@GroupId,@ActorUserId,@SourceKind,LTRIM(RTRIM(@DisplayName)),@LocationUrl,@Details,@RegionId,@SubRegionId,@ClientId);
-        SET @RequestId=SCOPE_IDENTITY();
-      END
-      ELSE
-      BEGIN
-        DECLARE @Status tinyint,@Requester uniqueidentifier;
-        SELECT @Status=RequestStatus,@Requester=RequestedByUserId,@SourceKind=SourceKind FROM dbo.di_sourceSetupRequest WITH(UPDLOCK,HOLDLOCK) WHERE RequestId=@RequestId AND GroupId=@GroupId AND RowVersion=@ExpectedRowVersion;
-        IF @Status IS NULL OR @ExpectedRowVersion IS NULL THROW 51005,'ACCESS_CONCURRENCY_CONFLICT',1;
-        IF @Command='CANCEL'
-        BEGIN
-          IF @Requester<>@ActorUserId OR @Status<>1 THROW 51003,'ACCESS_SOURCE_CANCELLATION_DENIED',1;
-        END
-        ELSE IF @CanManage=0 THROW 51003,'ACCESS_PERMISSION_DENIED',1;
-        IF @Command<>'CANCEL' AND (@Status NOT IN (1,2) OR (@Command='START' AND @Status<>1)) THROW 51007,'ACCESS_SOURCE_TRANSITION_INVALID',1;
-        IF @Command='REJECT' AND NULLIF(LTRIM(RTRIM(@ResolutionNote)),N'') IS NULL THROW 51002,'ACCESS_SOURCE_RESOLUTION_REQUIRED',1;
-        IF @Command='COMPLETE'
-        BEGIN
-          IF TRY_CONVERT(uniqueidentifier,@ResourceId) IS NULL THROW 51002,'ACCESS_SOURCE_RESOURCE_REQUIRED',1;
-          IF NOT EXISTS(SELECT 1 FROM dbo.di_groupScopeMapping m WHERE m.GroupId=@GroupId AND m.IsActive=1 AND m.ScopeKind=@SourceKind AND m.CanUse=1 AND m.CanManage=1 AND
-            ((@SourceKind='SHAREPOINT' AND m.SharePointApplicationId=TRY_CONVERT(uniqueidentifier,@ResourceId) AND EXISTS(SELECT 1 FROM dbo.di_application a WHERE a.applicationid=m.SharePointApplicationId AND a.isactive=1 AND a.deletedon IS NULL AND ISNULL(a.isdraft,0)=0)) OR
-             (@SourceKind='GDRIVE' AND m.GoogleDriveTenantId=TRY_CONVERT(uniqueidentifier,@ResourceId) AND EXISTS(SELECT 1 FROM dbo.di_gdrive_tenant t WHERE t.tenantid=m.GoogleDriveTenantId AND t.isactive=1 AND ISNULL(t.isdraft,0)=0))))
-            THROW 51003,'ACCESS_SOURCE_RESOURCE_NOT_CONFIGURED_AND_MAPPED',1;
-        END;
-        UPDATE dbo.di_sourceSetupRequest SET RequestStatus=CASE @Command WHEN 'START' THEN 2 WHEN 'COMPLETE' THEN 3 WHEN 'REJECT' THEN 4 ELSE 5 END,
-          ResourceId=CASE WHEN @Command='COMPLETE' THEN @ResourceId ELSE ResourceId END,ResolutionNote=@ResolutionNote,ResolvedByUserId=CASE WHEN @Command='CANCEL' THEN NULL ELSE @ActorUserId END,UpdatedAtUTC=@Now WHERE RequestId=@RequestId;
-      END;
-      SELECT RequestId,GroupId,RequestStatus,ResourceId,RowVersion FROM dbo.di_sourceSetupRequest WHERE RequestId=@RequestId;
-
-      INSERT dbo.di_accessAudit(OperationId,RequestHash,ActorUserId,ActorServiceCode,GroupId,EventCode,TargetType,TargetKey,Outcome,ChangeSummary,CorrelationId)
-      VALUES(@OperationId,@RequestHash,@ActorUserId,NULL,@GroupId,'commit_accessSourceRequest','ACCESS',COALESCE(CONVERT(nvarchar(200),@RequestId),N''),1,N'Command='+@Command,@CorrelationId);
-      COMMIT TRANSACTION;
-    END TRY
-    BEGIN CATCH
-      IF XACT_STATE()<>0 ROLLBACK TRANSACTION;
-      THROW;
-    END CATCH;
-END;
-GO
-
-SET ANSI_NULLS ON;
-SET QUOTED_IDENTIFIER ON;
-GO
-
-CREATE PROCEDURE dbo.commit_accessProcessAction
-    @ActorUserId uniqueidentifier,
-    @ActorSessionId uniqueidentifier,
-    @SessionHash binary(32),
-    @OperationId uniqueidentifier,
-    @RequestHash binary(32),
-    @CorrelationId uniqueidentifier,
-    @ExpectedRowVersion binary(8)=NULL,
-    @Command varchar(12),
-    @GroupId uniqueidentifier,
-    @ProcessId bigint,
-    @ExpectedStateVersion binary(32),
-    @ProcessName nvarchar(100)=NULL,
-    @Description nvarchar(4000)=NULL
-AS
-BEGIN
-    SET NOCOUNT ON;
-    SET XACT_ABORT ON;
-    DECLARE @Now datetime2(3)=SYSUTCDATETIME();
-    IF @OperationId IS NULL OR @RequestHash IS NULL OR @CorrelationId IS NULL THROW 51002,'ACCESS_COMMAND_METADATA_REQUIRED',1;
-    BEGIN TRY
-      BEGIN TRANSACTION;
-    IF NOT EXISTS (SELECT 1 FROM dbo.di_userSession s WITH(HOLDLOCK) JOIN dbo.di_userAccount u WITH(HOLDLOCK) ON u.UserId=s.UserId JOIN dbo.di_userIdentity i WITH(HOLDLOCK) ON i.IdentityId=s.IdentityId AND i.UserId=s.UserId WHERE s.SessionId=@ActorSessionId AND s.SessionHash=@SessionHash AND s.UserId=@ActorUserId AND s.RevokedAtUTC IS NULL AND s.AbsoluteExpiresAtUTC>@Now AND s.IdleExpiresAtUTC>@Now AND s.UserSecurityVersion=u.SecurityVersion AND u.AccountStatus=2 AND i.IdentityStatus=2) THROW 51001,'ACCESS_SESSION_INVALID',1;
-    DECLARE @ScopeGroupId uniqueidentifier=@GroupId;
-    DECLARE @AccessPermissions TABLE(PermissionCode varchar(100) PRIMARY KEY,DataScopeCode tinyint NOT NULL);
-    ;WITH EligibleRoles AS (
-      SELECT ur.RoleId,r.Priority FROM dbo.di_userRoleMapping ur WITH(HOLDLOCK) JOIN dbo.di_role r WITH(HOLDLOCK) ON r.RoleId=ur.RoleId AND r.IsActive=1
-      WHERE ur.UserId=@ActorUserId AND ur.IsActive=1 AND ur.BeginsAtUTC<=@Now AND (ur.EndsAtUTC IS NULL OR ur.EndsAtUTC>@Now)
-      AND ((ur.GrantScope='A' AND ur.RoleId IN (4,5)) OR (ur.GrantScope='G' AND ur.GroupId=@ScopeGroupId AND EXISTS (
-        SELECT 1 FROM dbo.di_groupMembership m WITH(HOLDLOCK) JOIN dbo.di_group g WITH(HOLDLOCK) ON g.GroupId=m.GroupId JOIN dbo.di_userAccount u WITH(HOLDLOCK) ON u.UserId=m.UserId LEFT JOIN dbo.di_userIdentity pi WITH(HOLDLOCK) ON pi.IdentityId=m.ProofIdentityId
-        JOIN dbo.di_groupRoleMapping gr WITH(HOLDLOCK) ON gr.GroupId=m.GroupId AND gr.RoleId=ur.RoleId AND gr.IsActive=1
-        WHERE m.MembershipId=ur.MembershipId AND m.UserId=ur.UserId AND ur.GrantMembershipEpoch=m.MembershipEpoch AND m.LocalState=1 AND m.ApprovalStatus IN (0,2,4) AND g.GroupStatus=2 AND (u.IsExternal=0 OR g.ProviderTypeId=3) AND (g.ProviderTypeId=3 OR (m.ProofStatus=1 AND m.ProofExpiresAtUTC>@Now AND m.ProofObservedAtUTC>=DATEADD(minute,-15,@Now) AND pi.IdentityStatus=2 AND pi.UserId=m.UserId AND pi.ProviderTypeId=g.ProviderTypeId AND ((g.ProviderTypeId=1 AND pi.ProviderNamespace=g.DirectoryKey) OR (g.ProviderTypeId=2 AND pi.ProviderNamespace IN ('https://accounts.google.com','accounts.google.com'))))))))
-      AND (@ScopeGroupId IS NULL OR EXISTS (SELECT 1 FROM dbo.di_group g JOIN dbo.di_userAccount u ON u.UserId=@ActorUserId WHERE g.GroupId=@ScopeGroupId AND g.GroupStatus<>4 AND (u.IsExternal=0 OR g.ProviderTypeId=3)))
-    ), Chosen AS (SELECT RoleId FROM EligibleRoles WHERE Priority=(SELECT MAX(Priority) FROM EligibleRoles))
-    INSERT @AccessPermissions SELECT p.PermissionCode,MAX(rp.DataScopeCode) FROM Chosen c JOIN dbo.di_rolePermission rp WITH(HOLDLOCK) ON rp.RoleId=c.RoleId AND rp.IsActive=1 JOIN dbo.di_info_permission p WITH(HOLDLOCK) ON p.PermissionId=rp.PermissionId AND p.IsActive=1 GROUP BY p.PermissionCode;
-
-      DECLARE @LockResult int;
-      DECLARE @LockName nvarchar(255)=N'DIAccessCommand:'+CONVERT(nvarchar(36),@OperationId);
-      EXEC @LockResult=sys.sp_getapplock @Resource=@LockName,@LockMode='Exclusive',@LockOwner='Transaction',@LockTimeout=5000;
-      IF @LockResult<0 THROW 51009,'ACCESS_COMMAND_BUSY',1;
-      IF EXISTS (SELECT 1 FROM dbo.di_accessAudit WHERE OperationId=@OperationId AND EventSequence=0)
-      BEGIN
-        IF NOT EXISTS (SELECT 1 FROM dbo.di_accessAudit WHERE OperationId=@OperationId AND EventSequence=0 AND RequestHash=@RequestHash AND EventCode='commit_accessProcessAction' AND ActorUserId=@ActorUserId) THROW 51004,'ACCESS_IDEMPOTENCY_CONFLICT',1;
-        SELECT 'AlreadyApplied' Disposition,TargetKey FROM dbo.di_accessAudit WHERE OperationId=@OperationId AND EventSequence=0;
-        COMMIT TRANSACTION; RETURN;
-      END;
-
-      IF @Command NOT IN ('EDIT','DISABLE','ENABLE','DELETE','REMOVE') OR @GroupId IS NULL OR @ProcessId IS NULL OR @ExpectedStateVersion IS NULL THROW 51002,'ACCESS_PROCESS_COMMAND_INVALID',1;
-      DECLARE @Permission varchar(100)=CASE WHEN @Command='EDIT' THEN 'PROCESS.EDIT' WHEN @Command IN ('DELETE','REMOVE') THEN 'PROCESS.DELETE' ELSE 'PROCESS.DISABLE' END;
-      DECLARE @ViewMode char(1)='G';
-
-    -- #region Read-only business access: scope before projection, paging and aggregation
-    DECLARE @DataScope tinyint=(SELECT DataScopeCode FROM @AccessPermissions WHERE PermissionCode=@Permission);
-    IF @ViewMode IS NULL OR @ViewMode NOT IN ('G','A') OR (@ViewMode='G' AND @GroupId IS NULL) OR (@ViewMode='A' AND @GroupId IS NOT NULL) THROW 51002,'ACCESS_BUSINESS_VIEW_INVALID',1;
-    IF (@ViewMode='A' AND ISNULL(@DataScope,0)<3) OR ISNULL(@DataScope,0) NOT BETWEEN 1 AND 3 THROW 51003,'ACCESS_BUSINESS_SCOPE_DENIED',1;
-    CREATE TABLE #EligibleGroups(GroupId uniqueidentifier NOT NULL PRIMARY KEY,LegacySecurityGroupId varchar(200) NOT NULL);
-    INSERT #EligibleGroups(GroupId,LegacySecurityGroupId)
-      SELECT g.GroupId,g.LegacySecurityGroupId FROM dbo.di_group g WITH(HOLDLOCK)
-      JOIN dbo.di_info_securityGroup oldg WITH(HOLDLOCK) ON oldg.id=g.LegacySecurityGroupRowId AND oldg.securityGroupId COLLATE Latin1_General_100_BIN2=g.LegacySecurityGroupId COLLATE Latin1_General_100_BIN2
-      WHERE g.GroupStatus=2 AND oldg.active=1 AND (@ViewMode='A' OR g.GroupId=@GroupId)
-        AND (g.ProviderTypeId=3 OR NOT EXISTS(SELECT 1 FROM dbo.di_userAccount WHERE UserId=@ActorUserId AND IsExternal=1));
-    -- #endregion
-
-      IF @DataScope NOT IN (2,3) THROW 51003,'ACCESS_PERMISSION_DENIED',1;
-      DECLARE @ConfigurationId nvarchar(100),@CurrentState binary(32);
-      SELECT @ConfigurationId=p.flpConfigurationId,@CurrentState=HASHBYTES('SHA2_256',CONVERT(varbinary(max),(SELECT p.process_name,p.Description,p.is_active,p.modified_date,p.regionId,p.subRegionId,p.clientId,p.sharePointApplicationId,p.sourcePath,p.destinationPath FOR JSON PATH,WITHOUT_ARRAY_WRAPPER,INCLUDE_NULL_VALUES))) FROM dbo.di_flpConfiguration p WITH(UPDLOCK,HOLDLOCK)
-        WHERE p.id=@ProcessId AND p.is_active IN (0,1) AND NOT EXISTS(SELECT 1 FROM dbo.di_flpConfiguration ambiguous WITH(HOLDLOCK) WHERE ambiguous.flpConfigurationId=p.flpConfigurationId AND ambiguous.id<>p.id) AND EXISTS(
-        SELECT 1 FROM #EligibleGroups eg
-        JOIN dbo.di_flpConfigurationSecurityGroupMapping oldm WITH(HOLDLOCK) ON oldm.securityGroupId=eg.LegacySecurityGroupId AND oldm.flpConfigurationId=p.flpConfigurationId AND oldm.active=1
-        JOIN dbo.di_groupScopeMapping sm WITH(HOLDLOCK) ON sm.GroupId=eg.GroupId AND sm.ScopeKind='REGION' AND sm.IsActive=1 AND sm.RegionId=p.regionId AND sm.ClientId=p.clientId AND CONVERT(varchar(55),sm.SubRegionId)=p.subRegionId
-        JOIN dbo.di_info_region r WITH(HOLDLOCK) ON r.Id=sm.RegionId AND r.active=1
-        JOIN dbo.di_info_sub_region sr WITH(HOLDLOCK) ON sr.Id=sm.SubRegionId AND sr.regionId=r.Id AND sr.active=1
-        JOIN dbo.di_info_clientnames c WITH(HOLDLOCK) ON c.Id=sm.ClientId AND c.active=1);
-      IF @ConfigurationId IS NULL THROW 51003,'ACCESS_PROCESS_SCOPE_DENIED',1;
-      IF @CurrentState<>@ExpectedStateVersion THROW 51005,'ACCESS_CONCURRENCY_CONFLICT',1;
-      DECLARE @LegacyGroup varchar(200)=(SELECT LegacySecurityGroupId FROM #EligibleGroups WHERE GroupId=@GroupId);
-      IF @Command='REMOVE'
-      BEGIN
-        -- Remove only this group's association. Other groups, files and schedules are retained.
-        UPDATE dbo.di_flpConfigurationSecurityGroupMapping SET active=0,updationDateTime=@Now WHERE flpConfigurationId=@ConfigurationId AND securityGroupId=@LegacyGroup AND active=1;
-        IF @@ROWCOUNT=0 THROW 51005,'ACCESS_CONCURRENCY_CONFLICT',1;
-      END
-      ELSE
-      BEGIN
-        -- Global configuration metadata affects every association, so shared rows require review.
-        IF EXISTS(SELECT 1 FROM dbo.di_flpConfigurationSecurityGroupMapping WITH(HOLDLOCK) WHERE flpConfigurationId=@ConfigurationId AND active=1 AND securityGroupId<>@LegacyGroup)
-          THROW 51040,'ACCESS_SHARED_PROCESS_REQUIRES_REVIEW',1;
-        IF @Command='EDIT' AND (NULLIF(LTRIM(RTRIM(@ProcessName)),N'') IS NULL OR CONVERT(nvarchar(100),CONVERT(varchar(100),@ProcessName)) COLLATE Latin1_General_100_BIN2<>@ProcessName COLLATE Latin1_General_100_BIN2
-          OR (@Description IS NOT NULL AND CONVERT(nvarchar(4000),CONVERT(varchar(4000),@Description)) COLLATE Latin1_General_100_BIN2<>@Description COLLATE Latin1_General_100_BIN2))
-          THROW 51002,'ACCESS_LEGACY_TEXT_ENCODING_UNSUPPORTED',1;
-        UPDATE dbo.di_flpConfiguration SET process_name=CASE WHEN @Command='EDIT' THEN @ProcessName ELSE process_name END,
-          Description=CASE WHEN @Command='EDIT' THEN @Description ELSE Description END,
-          is_active=CASE @Command WHEN 'DELETE' THEN 0 WHEN 'DISABLE' THEN 0 WHEN 'ENABLE' THEN 1 ELSE is_active END,modified_date=@Now,
-          updatedBy=CONVERT(varchar(36),@ActorUserId),updatedByName=(SELECT LEFT(DisplayName,150) FROM dbo.di_userAccount WHERE UserId=@ActorUserId)
-          WHERE id=@ProcessId;
-        -- Logical deletion retains configuration, mappings/history, files and schedules for recovery.
-        -- A shared configuration is rejected above before either table can be changed.
-        IF @Command='DELETE'
-          UPDATE dbo.di_flpConfigurationSecurityGroupMapping SET active=0,updationDateTime=@Now WHERE flpConfigurationId=@ConfigurationId AND securityGroupId=@LegacyGroup AND active=1;
-      END;
-      SELECT CONVERT(nvarchar(100),@ProcessId) AS ProcessId,@Command AS AppliedCommand;
-
-      INSERT dbo.di_accessAudit(OperationId,RequestHash,ActorUserId,ActorServiceCode,GroupId,EventCode,TargetType,TargetKey,Outcome,ChangeSummary,CorrelationId)
-      VALUES(@OperationId,@RequestHash,@ActorUserId,NULL,@GroupId,'commit_accessProcessAction','ACCESS',COALESCE(CONVERT(nvarchar(200),@ProcessId),N''),1,N'Command='+@Command,@CorrelationId);
-      COMMIT TRANSACTION;
-    END TRY
-    BEGIN CATCH
-      IF XACT_STATE()<>0 ROLLBACK TRANSACTION;
-      THROW;
-    END CATCH;
-END;
-GO
-
-GRANT EXECUTE ON OBJECT::dbo.sel_accessApplicationView TO access_api_executor;
-GRANT EXECUTE ON OBJECT::dbo.sel_accessHierarchy TO access_api_executor;
-GRANT EXECUTE ON OBJECT::dbo.sel_accessSources TO access_api_executor;
-GRANT EXECUTE ON OBJECT::dbo.commit_accessSourceRequest TO access_api_executor;
-GRANT EXECUTE ON OBJECT::dbo.commit_accessProcessAction TO access_api_executor;
-
-GO
+ SELECT DB_NAME() AS DatabaseName,N'Remaining four procedures and source-request schema applied' AS Result;
+ SELECT OBJECT_NAME(p.object_id) AS ProcedureName,p.name AS ParameterName,TYPE_NAME(p.user_type_id) AS DataType
+ FROM sys.parameters p JOIN (VALUES
+ (N'commit_accessIdentity',N'@CompanyDirectoryEligible'),
+ (N'commit_accessPermissionCatalog',N'@Command'),(N'commit_accessPermissionCatalog',N'@Description'),
+ (N'sel_accessGroupMappings',N'@CatalogKind'),(N'sel_accessGroupMappings',N'@Search'),
+ (N'sel_accessGroupMappings',N'@ParentId'),(N'sel_accessGroupMappings',N'@AfterValue'),
+ (N'sel_accessProcessList',N'@IncludeInactive')) expected(ProcedureName,ParameterName)
+ ON p.object_id=OBJECT_ID(N'dbo.'+expected.ProcedureName) AND p.name=expected.ParameterName
+ ORDER BY ProcedureName,ParameterName;
+ SELECT N'dbo.di_sourceSetupRequest' AS TableName,OBJECT_ID(N'dbo.di_sourceSetupRequest',N'U') AS ObjectId,
+ COL_LENGTH(N'dbo.di_info_permission',N'Description') AS PermissionDescriptionMaxBytes;
+END TRY
+BEGIN CATCH
+ IF XACT_STATE()<>0 ROLLBACK TRANSACTION;
+ THROW;
+END CATCH;
